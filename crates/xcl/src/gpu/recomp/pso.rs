@@ -353,6 +353,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
     if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
+        defer_direct_compute()?;
         match direct_compute(blob, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
@@ -365,6 +366,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     // the driver compiles its container 3 - 6x faster than DXC's (`huge_direct_min`)
     if stage == Stage::Compute && !crate::gpu::dxil::kernel::enabled() {
         if let Some(min) = huge_direct_min() {
+            defer_direct_compute()?;
             match direct_compute(blob, sampler_base, windows, split_wave64) {
                 Ok(c) if c.dxil.len() >= min => {
                     crate::xlog_info!("[SHADER] huge compute program {:016x}: direct DXIL ({} B)", crate::gpu::shader::fnv64(blob), c.dxil.len());
@@ -616,6 +618,18 @@ pub fn console_hlsl(blob: &[u8], stage: Stage, windows: u32, split_wave64: bool)
 /// 19.3 s -> 5.7 s for 107 - 264 KB containers). `XCL_DIRECT_HUGE=0` keeps every program on
 /// the HLSL path, `XCL_DIRECT_HUGE=<KiB>` moves the threshold.
 pub const HUGE_DIRECT_MIN_DEFAULT: usize = 64 << 10;
+
+/// Inside a cached-only probe (`dxc::cached_only`, the non-blocking PSO path): a compute
+/// program bound for the direct translator is not translated there – the translation caches
+/// were already checked – but reported as not compiled yet (`dxc::defer` marks the miss), so
+/// the probe hands out the stand-in and the build happens in the background. Without this a
+/// cold direct translation of a huge program would run synchronously on the title's thread.
+fn defer_direct_compute() -> Result<(), String> {
+    if dxc::defer() {
+        return Err("DXIL not compiled yet".into());
+    }
+    Ok(())
+}
 
 pub fn huge_direct_min() -> Option<usize> {
     static V: OnceLock<Option<usize>> = OnceLock::new();
@@ -1280,6 +1294,38 @@ mod shader_cache_tests {
                 assert_eq!(thread.join().unwrap().unwrap().dxil[0], 1);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod direct_probe_tests {
+    use super::*;
+
+    /// The probe contract for both direct compute routes (`XCL_DIRECT_DXIL=1` and the default
+    /// huge-program route): inside `cached_only` nothing is translated – the blob below is not
+    /// even a console container, so any translation attempt would fail differently – and the
+    /// attempt counts as a miss; outside it the same call does translate (and fails to parse).
+    #[test]
+    fn direct_compute_routes_defer_inside_cached_only_probes() {
+        if !crate::gpu::dxil::kernel::enabled() && huge_direct_min().is_none() {
+            return crate::gpu::recomp::runner::skip_test("no direct compute route (XCL_DIRECT_HUGE=0)");
+        }
+        let blob = b"not a console shader";
+        let (r, missed) = dxc::cached_only(|| compile_console_shader(blob, Stage::Compute, 0, 1, false));
+        assert!(missed, "a cached-only probe must mark the direct route as not compiled yet");
+        assert_eq!(r.err().as_deref(), Some("DXIL not compiled yet"));
+        // outside a probe the direct route runs (this blob then fails in translation, not deferral)
+        let e = compile_console_shader(blob, Stage::Compute, 0, 1, false).err().unwrap_or_default();
+        assert_ne!(e, "DXIL not compiled yet");
+        assert!(!dxc::in_cached_only());
+    }
+
+    /// `defer_direct_compute` only defers inside a probe.
+    #[test]
+    fn defer_direct_compute_is_a_no_op_outside_probes() {
+        assert!(defer_direct_compute().is_ok());
+        let (r, missed) = dxc::cached_only(defer_direct_compute);
+        assert!(missed && r.is_err());
     }
 }
 
