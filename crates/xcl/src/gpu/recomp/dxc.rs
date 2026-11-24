@@ -488,7 +488,9 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
+        // The repeated-block compact form has thousands of cases. -O1 spends minutes
+        // optimizing it, while -O0 compiles the same source in seconds.
+        if src.contains("static const uint XCL_RB[") || src.len() > 8 * 1024 * 1024 {
             args.push(crate::util::wide("-O0"));
         } else if src.len() > 1024 * 1024 {
             args.push(crate::util::wide("-O1"));

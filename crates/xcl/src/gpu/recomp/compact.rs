@@ -28,6 +28,52 @@ const HEAVY: usize = 600;
 /// at 15,360.
 const MAX_TABLE_WORDS: usize = 8192;
 
+/// A class assigned on its first occurrence equals the number of classes seen so far. Store
+/// only later references; the bitset and its per-word rank make every block a random lookup.
+struct RepeatTable {
+    repeats: Vec<u32>,
+    prefix: Vec<u32>,
+    refs: Vec<u32>,
+}
+
+fn repeat_table(class: &[u32], bits: u32) -> RepeatTable {
+    let mut repeats = vec![0u32; class.len().div_ceil(32)];
+    let mut prefix = Vec::with_capacity(repeats.len());
+    let mut refs = Vec::new();
+    let mut next = 0u32;
+    for (i, &c) in class.iter().enumerate() {
+        if i % 32 == 0 {
+            prefix.push(refs.len() as u32);
+        }
+        if c == next {
+            next += 1;
+        } else {
+            debug_assert!(c < next);
+            repeats[i / 32] |= 1 << (i % 32);
+            refs.push(c);
+        }
+    }
+    let mut packed = vec![0u32; (refs.len() * bits as usize).div_ceil(32)];
+    for (i, c) in refs.into_iter().enumerate() {
+        let bit = i * bits as usize;
+        let (word, shift) = (bit / 32, bit % 32);
+        packed[word] |= c << shift;
+        if shift + bits as usize > 32 {
+            packed[word + 1] |= c >> (32 - shift);
+        }
+    }
+    RepeatTable { repeats, prefix, refs: packed }
+}
+
+fn write_array(body: &mut String, name: &str, words: &[u32]) {
+    let _ = writeln!(body, "    static const uint {name}[{}] = {{", words.len());
+    for row in words.chunks(16) {
+        let row: Vec<String> = row.iter().map(|v| format!("{v:#x}u")).collect();
+        let _ = writeln!(body, "        {},", row.join(", "));
+    }
+    body.push_str("    };\n");
+}
+
 /// The compact form pays: at least `COMPACT_MIN_INSTRUCTIONS` instructions, and the distinct
 /// blocks (equal code, branch targets aside) hold under 30 % of them. A function of the code
 /// alone; nothing is emitted.
@@ -195,20 +241,50 @@ fn compact(code: &[u8], opt: &Options, heavy: usize) -> Result<Translation, Stri
     let bits = (usize::BITS - texts.len().saturating_sub(1).leading_zeros()).max(1);
     let per = (32 / bits) as usize;
     let words: Vec<u32> = class.chunks(per).map(|c| c.iter().enumerate().fold(0u32, |w, (j, &v)| w | v << (j as u32 * bits))).collect();
-    if words.len() > MAX_TABLE_WORDS {
-        return Err(format!("compact form: {n} blocks of {} texts need a {}-word table (at most {MAX_TABLE_WORDS})", texts.len(), words.len()));
-    }
     let mut body = String::new();
-    let _ = writeln!(body, "    static const uint XCL_BT[{}] = {{", words.len());
-    for row in words.chunks(16) {
-        let row: Vec<String> = row.iter().map(|v| format!("{v:#x}u")).collect();
-        let _ = writeln!(body, "        {},", row.join(", "));
+    let repeated = (words.len() > MAX_TABLE_WORDS).then(|| repeat_table(&class, bits));
+    if let Some(t) = &repeated {
+        let size = t.repeats.len() + t.prefix.len() + t.refs.len();
+        if size > MAX_TABLE_WORDS {
+            return Err(format!("compact form: {n} blocks of {} texts need a {size}-word repeated-block table (at most {MAX_TABLE_WORDS})", texts.len()));
+        }
+        write_array(&mut body, "XCL_RB", &t.repeats);
+        write_array(&mut body, "XCL_RP", &t.prefix);
+        write_array(&mut body, "XCL_RV", &t.refs);
+    } else {
+        write_array(&mut body, "XCL_BT", &words);
     }
-    body.push_str("    };\n    uint xcl_b = 0u;\n    [loop] for (;;) {\n        uint xcl_nb = xcl_b + 1u;\n");
+    body.push_str("    uint xcl_b = 0u;\n    [loop] for (;;) {\n        uint xcl_nb = xcl_b + 1u;\n");
     let mask = (1u64 << bits) - 1;
-    let _ = writeln!(body, "        switch ((XCL_BT[xcl_b / {per}u] >> (xcl_b % {per}u * {bits}u)) & {mask:#x}u) {{");
-    for (k, (text, pc)) in texts.iter().enumerate() {
-        let _ = write!(body, "        case {k}u: {{ // {pc:x}\n{text}        }} break;\n");
+    if repeated.is_some() {
+        body.push_str("        uint xcl_group = xcl_b / 32u;\n        uint xcl_pos = xcl_b % 32u;\n");
+        body.push_str("        uint xcl_flags = XCL_RB[xcl_group];\n");
+        body.push_str("        uint xcl_before = XCL_RP[xcl_group] + countbits(xcl_flags & ((1u << xcl_pos) - 1u));\n");
+        body.push_str("        uint xcl_case = xcl_b - xcl_before;\n");
+        body.push_str("        if ((xcl_flags & (1u << xcl_pos)) != 0u) {\n");
+        let _ = writeln!(body, "            uint xcl_bit = xcl_before * {bits}u;");
+        body.push_str("            uint xcl_word = xcl_bit / 32u;\n            uint xcl_shift = xcl_bit % 32u;\n");
+        body.push_str("            xcl_case = XCL_RV[xcl_word] >> xcl_shift;\n");
+        let _ = writeln!(body, "            if (xcl_shift + {bits}u > 32u) xcl_case |= XCL_RV[xcl_word + 1u] << (32u - xcl_shift);");
+        let _ = writeln!(body, "            xcl_case &= {mask:#x}u;");
+        body.push_str("        }\n        switch (xcl_case / 256u) {\n");
+    } else {
+        let _ = writeln!(body, "        switch ((XCL_BT[xcl_b / {per}u] >> (xcl_b % {per}u * {bits}u)) & {mask:#x}u) {{");
+    }
+    if repeated.is_some() {
+        // Keep DXC's control-flow work bounded by 256 cases per switch. The 11,909 distinct
+        // cases of ActivateRays in one switch still had not compiled after ten minutes.
+        for (section, chunk) in texts.chunks(256).enumerate() {
+            let _ = writeln!(body, "        case {section}u: {{ switch (xcl_case % 256u) {{");
+            for (k, (text, pc)) in chunk.iter().enumerate() {
+                let _ = write!(body, "            case {k}u: {{ // {pc:x}\n{text}            }} break;\n");
+            }
+            body.push_str("            default: xcl_nb = 0xFFFFFFFFu; break;\n        } } break;\n");
+        }
+    } else {
+        for (k, (text, pc)) in texts.iter().enumerate() {
+            let _ = write!(body, "        case {k}u: {{ // {pc:x}\n{text}        }} break;\n");
+        }
     }
     body.push_str("        default: xcl_nb = 0xFFFFFFFFu; break;\n        }\n");
     let _ = writeln!(body, "        if (xcl_nb >= {n}u) break;");
@@ -326,6 +402,44 @@ mod tests {
             different.extend(encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
         }
         assert!(!compact_wanted(&different));
+    }
+
+    #[test]
+    fn repeated_block_table_recovers_every_case() {
+        // The shape of ActivateRays: 19,949 blocks, 11,909 distinct cases. Include both
+        // new and repeated cases in each 32-block group and references crossing word edges.
+        let mut class = Vec::with_capacity(19_949);
+        let mut next = 0u32;
+        for i in 0..19_949 {
+            if next < 11_909 && (next == 0 || i % 5 != 0) {
+                class.push(next);
+                next += 1;
+            } else {
+                class.push((i * 137 % next as usize) as u32);
+            }
+        }
+        assert_eq!(next, 11_909);
+        let bits = 14u32;
+        let t = repeat_table(&class, bits);
+        assert!(t.repeats.len() + t.prefix.len() + t.refs.len() <= MAX_TABLE_WORDS);
+        for (i, &expected) in class.iter().enumerate() {
+            let group = i / 32;
+            let pos = i % 32;
+            let flags = t.repeats[group];
+            let before = t.prefix[group] + (flags & ((1u32 << pos) - 1)).count_ones();
+            let actual = if flags & (1 << pos) == 0 {
+                i as u32 - before
+            } else {
+                let bit = before as usize * bits as usize;
+                let (word, shift) = (bit / 32, bit % 32);
+                let mut c = t.refs[word] >> shift;
+                if shift + bits as usize > 32 {
+                    c |= t.refs[word + 1] << (32 - shift);
+                }
+                c & ((1 << bits) - 1)
+            };
+            assert_eq!(actual, expected, "block {i}");
+        }
     }
 
     /// The compact form ends in the same state as `translate` (both block cuts).
