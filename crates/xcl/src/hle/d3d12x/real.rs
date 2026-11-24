@@ -3552,6 +3552,30 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
     Some(slot)
 }
 
+/// `big_compile_turn` for a big driver compile on a worker (none on the title's threads). Err: a
+/// build ahead of first use that nobody waits for would wait for its turn – it stands back instead
+/// (`pso_async::stand_back`), its worker builds the next one, and it is built once a turn is free.
+/// (#1269: in a retail title's run, three preload workers each waited for the turn with a big
+/// program and built nothing from 132 to 195 s.)
+fn big_compile_turn_here(slots: &'static Slots, commit_free: fn() -> bool) -> Result<Option<SlotGuard>, ()> {
+    if !std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso")) {
+        return Ok(None);
+    }
+    if !super::pso_async::build_can_stand_back() {
+        return Ok(big_compile_turn(slots, commit_free, super::pso_async::build_is_wanted));
+    }
+    let free = move || *slots.n.lock().unwrap() < slots.most && commit_free();
+    {
+        let mut n = slots.n.lock().unwrap();
+        if *n < slots.most && commit_free() {
+            *n += 1;
+            return Ok(Some(SlotGuard(slots)));
+        }
+    }
+    super::pso_async::stand_back(Box::new(free));
+    Err(())
+}
+
 /// 3 GB of commit are free (true when that is not known).
 fn big_compile_commit_free() -> bool {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -3603,6 +3627,98 @@ mod big_compile_tests {
         drop(first);
         assert!(t.join().unwrap(), "the next one's turn");
         assert_eq!(*S.n.lock().unwrap(), 0);
+    }
+
+    /// The job of a big build with `slots` for its turn: its stand-backs and builds.
+    struct Big {
+        slots: &'static Slots,
+        stood: AtomicUsize,
+        built: AtomicUsize,
+    }
+
+    fn big_job(b: &'static Big, real: usize) -> super::super::pso_async::Job {
+        Box::new(move || match big_compile_turn_here(b.slots, || true) {
+            Err(()) => {
+                b.stood.fetch_add(1, Ordering::SeqCst);
+                0
+            }
+            Ok(_turn) => {
+                b.built.fetch_add(1, Ordering::SeqCst);
+                real
+            }
+        })
+    }
+
+    fn within_5_s(what: impl Fn() -> bool) -> bool {
+        let t = Instant::now();
+        while !what() && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        what()
+    }
+
+    /// With the turn taken, the preload workers do not wait for it with a big build each: more big
+    /// builds than workers (at most 4) stand back, and the small one queued behind them is built.
+    #[test]
+    fn builds_ahead_stand_back_for_a_taken_turn_and_their_workers_go_on() {
+        use super::super::pso_async::{is_pending, released, submit_ahead};
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        static B: Big = Big { slots: &S, stood: AtomicUsize::new(0), built: AtomicUsize::new(0) };
+        let held = big_compile_turn(&S, || true, || false).expect("a free slot");
+        let bigs = [0x7E57_B161usize, 0x7E57_B162, 0x7E57_B163, 0x7E57_B164];
+        for (k, &big) in bigs.iter().enumerate() {
+            submit_ahead(big, true, big_job(&B, 0xB160 + k), 0x5EED_B161 + k as u64);
+        }
+        let small = 0x7E57_B165usize;
+        submit_ahead(small, true, Box::new(|| 0xB165), 0x5EED_B165);
+        assert!(within_5_s(|| !is_pending(small)), "the small one is built behind the big ones");
+        assert!(within_5_s(|| B.stood.load(Ordering::SeqCst) >= bigs.len()), "every big one stood back");
+        assert_eq!(B.built.load(Ordering::SeqCst), 0, "none built while the turn is taken");
+        assert!(bigs.iter().all(|&b| is_pending(b)));
+        assert_eq!(*S.n.lock().unwrap(), 1, "no turn taken by them");
+        // (released while they wait: not built at all)
+        bigs.iter().for_each(|&b| assert_eq!(released(b), 0));
+        let _ = released(small);
+        drop(held);
+    }
+
+    /// A build that stood back for a taken turn is built once the turn is free.
+    #[test]
+    fn a_build_that_stood_back_is_built_once_its_turn_is_free() {
+        use super::super::pso_async::{is_pending, released, resolve, submit_ahead};
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        static B: Big = Big { slots: &S, stood: AtomicUsize::new(0), built: AtomicUsize::new(0) };
+        let held = big_compile_turn(&S, || true, || false).expect("a free slot");
+        let big = 0x7E57_B171usize;
+        submit_ahead(big, true, big_job(&B, 0xB171), 0x5EED_B171);
+        assert!(within_5_s(|| B.stood.load(Ordering::SeqCst) >= 1), "it stood back");
+        assert!(is_pending(big));
+        drop(held);
+        assert!(within_5_s(|| !is_pending(big)), "built once the turn is free");
+        assert_eq!(B.built.load(Ordering::SeqCst), 1);
+        assert_eq!(resolve(big), 0xB171);
+        assert_eq!(*S.n.lock().unwrap(), 0, "its turn went back");
+        let _ = released(big);
+    }
+
+    /// A bind of a build that stood back gets it built while the turn is still taken (on its own
+    /// thread, or by the worker that sees the bind), and it is built once: the preload workers do
+    /// not build it again when the turn is free.
+    #[test]
+    fn a_bind_builds_a_build_that_stood_back_once() {
+        use super::super::pso_async::{released, resolve_wait, submit_ahead};
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        static B: Big = Big { slots: &S, stood: AtomicUsize::new(0), built: AtomicUsize::new(0) };
+        let held = big_compile_turn(&S, || true, || false).expect("a free slot");
+        let big = 0x7E57_B181usize;
+        submit_ahead(big, true, big_job(&B, 0xB181), 0x5EED_B181);
+        assert!(within_5_s(|| B.stood.load(Ordering::SeqCst) >= 1), "it stood back");
+        assert_eq!(resolve_wait(big), 0xB181, "built for the bind while the turn is taken");
+        drop(held);
+        // (the preload workers look at what stood back every 50 ms)
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(B.built.load(Ordering::SeqCst), 1, "built once");
+        let _ = released(big);
     }
 }
 
@@ -3659,8 +3775,9 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
     // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
-    let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso")))
-        .then(|| big_compile_turn(&BIG_COMPILES, big_compile_commit_free, super::pso_async::build_is_wanted));
+    let Ok(_slot) = (big && cached.is_none()).then(|| big_compile_turn_here(&BIG_COMPILES, big_compile_commit_free)).transpose() else {
+        return Some(Err(()));
+    };
     let started = std::time::Instant::now();
     let mut hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     if hr < 0 && cached.is_some() {

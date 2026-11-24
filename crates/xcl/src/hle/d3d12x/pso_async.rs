@@ -43,12 +43,33 @@ struct Demand {
 thread_local! {
     /// what this worker is building
     static BUILDING: std::cell::RefCell<Option<Arc<Pending>>> = const { std::cell::RefCell::new(None) };
+    /// the build this worker runs stood back (`stand_back`): when to build it again
+    static STOOD_BACK: std::cell::Cell<Option<Ready>> = const { std::cell::Cell::new(None) };
 }
 
 /// This thread is a worker and one of the title's threads waits for what it is building: the
 /// build must not stand back for the title's sake (`real::big_compile_turn`).
 pub(super) fn build_is_wanted() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
+}
+
+/// This thread builds ahead of first use (`preload`) and nobody waits for the build: rather than
+/// wait for a big compile's turn, it can stand back (`stand_back`).
+pub(super) fn build_can_stand_back() -> bool {
+    let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| {
+        let d = p.demand.lock().unwrap();
+        d.preload_thread == me && !d.wanted
+    }))
+}
+
+/// Whether a build that stood back can have its turn now.
+pub(super) type Ready = Box<dyn Fn() -> bool + Send>;
+
+/// The build this thread runs (`build_can_stand_back`) gives up its turn: its job goes back to the
+/// preload workers, who build the next one meanwhile and this one again once `ready`.
+pub(super) fn stand_back(ready: Ready) {
+    STOOD_BACK.with(|s| s.set(Some(ready)));
 }
 
 /// Whether one of the title's threads waits for what this thread is doing, to be asked later and
@@ -62,8 +83,9 @@ pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
     Box::new(move || own)
 }
 
-/// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
-fn build(p: &Arc<Pending>, job: Job, preload: bool) {
+/// A worker's build of `p` (`preload`: by one of the lowest-priority workers). Some: it stood back
+/// (`stand_back`), its job is back in `p` – to be built again once it is ready.
+fn build(p: &Arc<Pending>, mut job: Job, preload: bool) -> Option<Ready> {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
     BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
     if preload {
@@ -73,7 +95,22 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
-    complete(p, job());
+    let mut real = job();
+    let mut stood_back = None;
+    while let Some(ready) = STOOD_BACK.with(|s| s.take()) {
+        // (under `demand`: a bind that waits for it from now on finds the job – `resolve_wait_for`)
+        let d = p.demand.lock().unwrap();
+        if !d.wanted {
+            *p.job.lock().unwrap() = Some(job);
+            stood_back = Some(ready);
+            break;
+        }
+        drop(d);
+        real = job();
+    }
+    if stood_back.is_none() {
+        complete(p, real);
+    }
     if preload {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
@@ -83,6 +120,7 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
         }
     }
     BUILDING.with(|b| *b.borrow_mut() = None);
+    stood_back
 }
 
 impl Pending {
@@ -142,8 +180,8 @@ pub fn enabled() -> bool {
     std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
 }
 
-/// Builds the real pipeline: its raw pointer, 0 = failed.
-pub type Job = Box<dyn FnOnce() -> usize + Send>;
+/// Builds the real pipeline: its raw pointer, 0 = failed (run again after it stood back: `stand_back`).
+pub type Job = Box<dyn FnMut() -> usize + Send>;
 
 fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
     static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
@@ -306,6 +344,18 @@ mod used {
 struct Preload {
     list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
     cv: Condvar,
+    /// builds that stood back for a big compile's turn (`stand_back`)
+    deferred: Mutex<std::collections::VecDeque<(Arc<Pending>, Ready)>>,
+}
+
+impl Preload {
+    /// A build that stood back that a bind waits for or the title released, else the first one
+    /// once it can have its turn (`ready` asked once).
+    fn take_deferred(&self) -> Option<Arc<Pending>> {
+        let mut d = self.deferred.lock().unwrap();
+        let k = d.iter().position(|(p, _)| p.orphan.load(Ordering::Acquire) || p.demand.lock().unwrap().wanted).or_else(|| d.front().filter(|(_, ready)| ready()).map(|_| 0))?;
+        d.remove(k).map(|(p, _)| p)
+    }
 }
 
 fn preload() -> Option<&'static Preload> {
@@ -316,7 +366,7 @@ fn preload() -> Option<&'static Preload> {
             if std::env::var("XCL_PSO_PRELOAD").is_ok_and(|v| v.trim() == "0") {
                 return None;
             }
-            Some(Preload { list: Mutex::new(Default::default()), cv: Condvar::new() })
+            Some(Preload { list: Mutex::new(Default::default()), cv: Condvar::new(), deferred: Mutex::new(Default::default()) })
         })
         .as_ref()?;
     STARTED.call_once(|| {
@@ -332,10 +382,15 @@ fn preload() -> Option<&'static Preload> {
                     let p = {
                         let mut g = q.list.lock().unwrap();
                         loop {
-                            if let Some(p) = g.pop_front() {
+                            if let Some(p) = q.take_deferred().or_else(|| g.pop_front()) {
                                 break p;
                             }
-                            g = q.cv.wait(g).unwrap();
+                            let none_deferred = q.deferred.lock().unwrap().is_empty();
+                            g = match none_deferred {
+                                true => q.cv.wait(g).unwrap(),
+                                // (a build that stood back: looked at again every 50 ms, as `big_compile_turn` looks)
+                                false => q.cv.wait_timeout(g, std::time::Duration::from_millis(50)).unwrap().0,
+                            };
                         }
                     };
                     // (released by the title meanwhile)
@@ -345,7 +400,15 @@ fn preload() -> Option<&'static Preload> {
                     // (None: a bind took it and builds it itself)
                     let job = p.job.lock().unwrap().take();
                     if let Some(job) = job {
-                        build(&p, job, true);
+                        if let Some(ready) = build(&p, job, true) {
+                            q.deferred.lock().unwrap().push_back((p, ready));
+                            static STOOD: AtomicUsize = AtomicUsize::new(0);
+                            let n = STOOD.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_power_of_two() {
+                                crate::xlog_info!("D3D12.X: {n} builds ahead of their first use stood back for a big compile's turn");
+                            }
+                            continue;
+                        }
                         let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
                         if n.is_power_of_two() {
                             crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
@@ -460,6 +523,13 @@ mod used_tests {
     }
 }
 
+/// (tests) `submit_lazy` of a pipeline of shaders an earlier run used: built ahead of its first use.
+#[cfg(test)]
+pub(super) fn submit_ahead(standin: usize, compute: bool, job: Job, key: u64) {
+    used::earlier_run_used(key);
+    submit_lazy(standin, compute, job, key);
+}
+
 fn entry(pso: usize) -> Option<Arc<Pending>> {
     PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
@@ -493,11 +563,13 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
+    // (wanted first: a build ahead of first use either goes on, or has stood back with its job
+    // back in `p` – `build`)
+    p.want();
     let job = p.job.lock().unwrap().take();
-    if let Some(job) = job {
+    if let Some(mut job) = job {
         complete(&p, job());
     }
-    p.want();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
