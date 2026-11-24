@@ -192,6 +192,9 @@ mod translated {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(super) enum Backend {
         Hlsl,
+        /// the HLSL path, huge compute programs (direct DXIL of at least this many bytes,
+        /// `huge_direct_min`) through the direct translator
+        HlslHugeDirect(usize),
         /// direct DXIL for compute + the mesh pass (`=1`)
         DirectCompute,
         /// direct DXIL for VS / PS too (`=all`)
@@ -203,7 +206,7 @@ mod translated {
             match (crate::gpu::dxil::kernel::enabled(), crate::gpu::dxil::kernel::enabled_graphics()) {
                 (_, true) => Backend::DirectAll,
                 (true, false) => Backend::DirectCompute,
-                _ => Backend::Hlsl,
+                _ => super::huge_direct_min().map_or(Backend::Hlsl, Backend::HlslHugeDirect),
             }
         }
     }
@@ -214,9 +217,14 @@ mod translated {
         let base = identity_for(source, toolchain);
         let tag = match backend {
             Backend::Hlsl => return base,
+            Backend::HlslHugeDirect(min) => return identity_tagged(base, &format!("huge-direct-{min}"), direct_version),
             Backend::DirectCompute => "compute",
             Backend::DirectAll => "all",
         };
+        identity_tagged(base, tag, direct_version)
+    }
+
+    fn identity_tagged(base: u64, tag: &str, direct_version: u32) -> u64 {
         let mut h = base;
         for part in ["xcl-direct-dxil", tag, &direct_version.to_string()] {
             for byte in part.bytes().chain([0]) {
@@ -351,6 +359,20 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
                 return Ok(c);
             }
             Err(e) => direct_fallback("CS", &e),
+        }
+    }
+    // a huge compute program through the direct translator also without `XCL_DIRECT_DXIL`:
+    // the driver compiles its container 3 - 6x faster than DXC's (`huge_direct_min`)
+    if stage == Stage::Compute && !crate::gpu::dxil::kernel::enabled() {
+        if let Some(min) = huge_direct_min() {
+            match direct_compute(blob, sampler_base, windows, split_wave64) {
+                Ok(c) if c.dxil.len() >= min => {
+                    crate::xlog_info!("[SHADER] huge compute program {:016x}: direct DXIL ({} B)", crate::gpu::shader::fnv64(blob), c.dxil.len());
+                    return Ok(c);
+                }
+                Ok(_) => {}
+                Err(e) => crate::xlog_info!("[SHADER] huge-program direct DXIL unavailable: {}", e.lines().next().unwrap_or("")),
+            }
         }
     }
     // `XCL_DIRECT_DXIL=all`: vertex / pixel shaders too (not with the PS debug hooks below)
@@ -587,6 +609,27 @@ pub fn console_hlsl(blob: &[u8], stage: Stage, windows: u32, split_wave64: bool)
     console_translation(blob, stage, 0, windows, split_wave64).map(|(t, p)| (t.hlsl, p))
 }
 
+/// Direct DXIL size from which a compute program takes the direct translator by default
+/// (no `XCL_DIRECT_DXIL`). Its containers are smaller than DXC's for the same program and
+/// lack the HLSL path's per-access window `switch`es and helper inlining, so the driver
+/// compiles them much faster (RTX 4090, cold: 11.7 s -> 1.8 s, 17.0 s -> 5.9 s,
+/// 19.3 s -> 5.7 s for 107 - 264 KB containers). `XCL_DIRECT_HUGE=0` keeps every program on
+/// the HLSL path, `XCL_DIRECT_HUGE=<KiB>` moves the threshold.
+pub const HUGE_DIRECT_MIN_DEFAULT: usize = 64 << 10;
+
+pub fn huge_direct_min() -> Option<usize> {
+    static V: OnceLock<Option<usize>> = OnceLock::new();
+    *V.get_or_init(|| huge_direct_min_from(std::env::var("XCL_DIRECT_HUGE").ok().as_deref()))
+}
+
+fn huge_direct_min_from(v: Option<&str>) -> Option<usize> {
+    match v.map(str::trim) {
+        None | Some("") | Some("1") => Some(HUGE_DIRECT_MIN_DEFAULT),
+        Some("0") => None,
+        Some(kib) => Some(kib.parse::<usize>().map_or(HUGE_DIRECT_MIN_DEFAULT, |k| k.max(1) << 10)),
+    }
+}
+
 /// A direct DXIL translation that fell back to the HLSL path: one structured log line
 /// (`stage=… reason=…`, the reason with operands stripped) and the live summary counter
 /// (`XCL_DIRECT_DXIL_STATS=1`, `gpu::dxil::coverage`).
@@ -597,7 +640,7 @@ fn direct_fallback(stage: &str, err: &str) {
 
 /// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
 /// FSPX (driver) containers are left to the HLSL path.
-fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+pub(crate) fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)).ok_or("no hardware CS variant")?;
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
@@ -965,12 +1008,24 @@ mod shader_cache_tests {
             hlsl,
             identity_with("s", "t", Backend::DirectCompute, 1),
             identity_with("s", "t", Backend::DirectAll, 1),
+            identity_with("s", "t", Backend::HlslHugeDirect(64 << 10), 1),
+            identity_with("s", "t", Backend::HlslHugeDirect(64 << 10), 2),
+            identity_with("s", "t", Backend::HlslHugeDirect(128 << 10), 1),
             identity_with("s", "t", Backend::DirectCompute, 2),
             identity_with("s2", "t", Backend::DirectCompute, 1),
             identity_with("s", "t2", Backend::DirectCompute, 1),
         ];
         assert!(ids.iter().all(|&i| i != 0));
         assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), ids.len());
+    }
+
+    #[test]
+    fn huge_direct_threshold_from_env() {
+        assert_eq!(huge_direct_min_from(None), Some(HUGE_DIRECT_MIN_DEFAULT));
+        assert_eq!(huge_direct_min_from(Some("1")), Some(HUGE_DIRECT_MIN_DEFAULT));
+        assert_eq!(huge_direct_min_from(Some("0")), None);
+        assert_eq!(huge_direct_min_from(Some(" 200 ")), Some(200 << 10));
+        assert_eq!(huge_direct_min_from(Some("junk")), Some(HUGE_DIRECT_MIN_DEFAULT));
     }
 
     /// Hit / miss through a temp cache dir: a direct entry is reused by the same identity and
