@@ -16,6 +16,7 @@ pub mod cfg;
 pub mod container;
 pub mod coverage;
 pub mod graphics;
+mod group_barrier;
 pub mod kernel;
 mod lanes;
 pub mod lower;
