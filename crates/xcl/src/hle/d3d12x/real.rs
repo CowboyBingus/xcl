@@ -5010,6 +5010,8 @@ pub struct TwoPassPso {
     pub mesh_groups_per_record: u32,
     /// "MS" or "GS"
     pub kind: &'static str,
+    /// lab: FNV-1a of the console MS container (0: GS)
+    pub ms_hash: u64,
 }
 
 impl Drop for TwoPassPso {
@@ -5130,7 +5132,7 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>
 /// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
 /// the title gets the mesh pipeline state.
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, ms_hash: u64, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
@@ -5199,7 +5201,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         return E_INVALIDARG;
     }
     note_pso_rs(*ppv, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind, ms_hash }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
         crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
@@ -5439,7 +5441,15 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
+    // lab: `XCL_MS_DUMP_DIR`: the console MS containers of the two-pass pipelines, by hash
+    let ms_hash = crate::gpu::shader::fnv64(ms);
+    if let Some(dir) = std::env::var_os("XCL_MS_DUMP_DIR") {
+        let f = std::path::Path::new(&dir).join(format!("{ms_hash:016x}.ms"));
+        if !f.exists() {
+            let _ = std::fs::write(f, ms);
+        }
+    }
+    Some(finish_two_pass(this, &out, tp, rs, "MS", ms_hash, riid, ppv))
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
@@ -5510,7 +5520,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
+    finish_two_pass(this, &out, tp, rs, "GS", 0, riid, ppv)
 }
 
 /// A console MS container in the stream's AS subobject and no MS subobject (`mesh_shader_slots`).

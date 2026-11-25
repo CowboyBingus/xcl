@@ -552,6 +552,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         let need = (groups as u64).saturating_mul(rec_bytes);
         let run = (|| -> Result<(), String> {
             let (res_buf, res_va) = ensure_res_buffer(this, need)?;
+            ms_probe(this, "DM", &tp, groups);
             bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
             list.Dispatch(groups, 1, 1);
             emit_uav_barrier(list, Some(&res_buf));
@@ -643,6 +644,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             ei_peek(this, 0, max, args, args_off + u64::from(msig.mesh_offset), count_buf, count_off);
             let run = (|| -> Result<(), String> {
                 let (res_buf, res_va) = ensure_res_buffer(this, RES_BYTES)?;
+                ms_probe(this, "EI", &tp, max);
                 bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
                 // both passes read the records a dispatch before them wrote (the title's own, or
                 // the bounded copy): ordered after those writes as any other ExecuteIndirect is
@@ -791,10 +793,15 @@ unsafe fn ei_peek(this: *mut c_void, kind: u8, max: u32, args: usize, args_at: u
     if CALLS[kind as usize & 15].fetch_add(1, Ordering::Relaxed) % every != 0 {
         return;
     }
-    let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    ei_peek_slot(this, kind, max, args, args_at, count_buf, count_off);
+}
+
+/// lab: one peek slot (no sampling); its index
+unsafe fn ei_peek_slot(this: *mut c_void, kind: u8, max: u32, args: usize, args_at: u64, count_buf: usize, count_off: u64) -> Option<usize> {
+    let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?;
     let mut g = EI_PEEK.lock().unwrap();
     if g.is_none() {
-        let Some(dev) = super::real::list_device(this) else { return };
+        let dev = super::real::list_device(this)?;
         let mut rb: Option<ID3D12Resource> = None;
         let made = dev.CreateCommittedResource(
             &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
@@ -813,7 +820,7 @@ unsafe fn ei_peek(this: *mut c_void, kind: u8, max: u32, args: usize, args_at: u
             None,
             &mut rb,
         );
-        let (Ok(()), Some(rb)) = (made, rb) else { return };
+        let (Ok(()), Some(rb)) = (made, rb) else { return None };
         // marks: a slot the GPU has not written yet reads 0xEEEEEEEE
         let mut p: *mut c_void = std::ptr::null_mut();
         if rb.Map(0, None, Some(&mut p)).is_ok() && !p.is_null() {
@@ -828,13 +835,13 @@ unsafe fn ei_peek(this: *mut c_void, kind: u8, max: u32, args: usize, args_at: u
             }
         });
     }
-    let Some(pk) = g.as_mut() else { return };
+    let pk = g.as_mut()?;
     let slot = pk.meta.len();
     if slot >= EI_PEEK_SLOTS {
-        return;
+        return None;
     }
     let a = args as *mut c_void;
-    let Some(a) = ID3D12Resource::from_raw_borrowed(&a) else { return };
+    let a = ID3D12Resource::from_raw_borrowed(&a)?;
     list.CopyBufferRegion(&pk.rb, (slot * 32) as u64, a, args_at, 12);
     let c = count_buf as *mut c_void;
     let has_count = match ID3D12Resource::from_raw_borrowed(&c) {
@@ -845,7 +852,61 @@ unsafe fn ei_peek(this: *mut c_void, kind: u8, max: u32, args: usize, args_at: u
         _ => false,
     };
     pk.meta.push((crate::log::uptime(), kind, max, has_count));
+    Some(slot)
 }
+
+/// lab: `XCL_MS_PROBE=t`: what a two-pass mesh draw's program is given, for the retail title's
+/// wrapped-VS mesh shaders (s17 = descriptor table, +0x60 = the meshlet buffer; its dword 0 =
+/// meshlet count, +12.. = the meshlets, 16 bytes each): the CPU's view logged here, the GPU's
+/// view of the same bytes through the window buffer in peek slots (kind 12: dwords 0..3,
+/// kind 13: dwords 4..7 of the meshlet buffer; 14: dwords 0..3 of the descriptor at +0x60).
+unsafe fn ms_probe(this: *mut c_void, what: &str, tp: &super::real::TwoPassPso, groups: u32) {
+    static FROM: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    let Some(from) = *FROM.get_or_init(|| std::env::var("XCL_MS_PROBE").ok().and_then(|v| v.trim().parse().ok())) else { return };
+    if crate::log::uptime() < from {
+        return;
+    }
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| std::env::var("XCL_MS_PROBE_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16u64).max(1));
+    if CALLS.fetch_add(1, Ordering::Relaxed) % every != 0 || LOGGED.load(Ordering::Relaxed) >= 400 {
+        return;
+    }
+    LOGGED.fetch_add(1, Ordering::Relaxed);
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
+    let inline_ms = layout.as_ref().map_or(0, |l| l.inline_ms as usize).min(args.len());
+    let w: Vec<u32> = args[..inline_ms].chunks(4).map(|c| { let mut b = [0u8; 4]; b[..c.len()].copy_from_slice(c); u32::from_le_bytes(b) }).collect();
+    let g = |i: usize| w.get(i).copied().unwrap_or(0);
+    let cpu = |p: usize, n: usize| -> Option<Vec<u32>> {
+        crate::gpu::shader::readable(p, 4 * n).then(|| (0..n).map(|i| ((p + 4 * i) as *const u32).read_unaligned()).collect())
+    };
+    let fmt = |v: &Option<Vec<u32>>| v.as_ref().map_or("unreadable".to_string(), |v| v.iter().map(|x| format!("{x:x}")).collect::<Vec<_>>().join(" "));
+    let table = u.base() + g(1) as usize;
+    let desc = cpu(table + 0x60, 4);
+    let mut line = format!("ms probe: {what} MS {:016x} groups {groups} threads {} maxv {} maxp {} vd {}; inline {} B of {}: s16.. = [{}]; table {table:#x} +0x60 = [{}]", tp.ms_hash, tp.record.threads, tp.record.max_vertices, tp.record.max_primitives, tp.record.vert_dwords(), inline_ms, args.len(), w.iter().map(|x| format!("{x:x}")).collect::<Vec<_>>().join(" "), fmt(&desc));
+    if let Some((b, o)) = super::real::uma_window_buffer(table + 0x60, 16) {
+        let slot = ei_peek_slot(this, 14, groups, b, o, b, o + 12);
+        line += &format!(" (gpu slot {slot:?})");
+    }
+    if let Some(d) = &desc {
+        let buf = ((d[1] as usize & 0xFFFF) << 32) | d[0] as usize;
+        // an address with no high part is in window 0 (as the shaders read it)
+        let buf = if buf >> 32 == 0 { u.base() + buf } else { buf };
+        let m = cpu(buf, 8);
+        line += &format!("; meshlets at {buf:#x} (window {:?}, sparse {}): cpu [{}]", u.window_of(buf), u.is_sparse(buf), fmt(&m));
+        if let Some((b, o)) = super::real::uma_window_buffer(buf, 32) {
+            let s0 = ei_peek_slot(this, 12, groups, b, o, b, o + 12);
+            let s1 = ei_peek_slot(this, 13, groups, b, o + 16, b, o + 28);
+            line += &format!(" (gpu slots {s0:?} {s1:?})");
+        } else {
+            line += " (no window buffer)";
+        }
+    }
+    crate::xlog_info!("{line}");
+}
+
 
 fn ei_peek_report() {
     let g = EI_PEEK.lock().unwrap();
@@ -882,6 +943,11 @@ fn ei_peek_report() {
                 } else {
                     row.5.push(format!("max {max} [{x:#x} {y:#x} {z:#x}]{}", if has_count { format!(" count {c:#x}") } else { String::new() }));
                 }
+            }
+        }
+        for (slot, &(_, kind, _, _)) in pk.meta.iter().enumerate() {
+            if (12..=14).contains(&kind) {
+                crate::xlog_info!("ms probe: gpu slot {slot} kind {kind}: [{:x} {:x} {:x} {:x}]", w(slot, 0), w(slot, 1), w(slot, 2), w(slot, 4));
             }
         }
         crate::xlog_info!("ei peek: {} calls sampled (kind 0 two-pass mesh bounded, 1 graphics, 2 compute, 3 two-pass mesh as the title wrote them; record 0 after the compute pass: 4 header + 5/6/7 positions (EI), 8 header + 9/10/11 positions (direct, max = groups))", pk.meta.len());
