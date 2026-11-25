@@ -435,6 +435,26 @@ pub fn resource_at(at: usize) -> Option<usize> {
     RES.lock().unwrap().as_ref()?.get(&at).copied()
 }
 
+/// lab: `resource_by_word0` from a table of all slots that is at most 3 s old (the scan reads
+/// every slot: far too slow for every dispatch – it stopped the title's render threads).
+pub fn resource_by_word0_cached(w0: u32) -> Option<usize> {
+    static CACHE: Mutex<Option<(std::time::Instant, std::collections::HashMap<u32, usize>)>> = Mutex::new(None);
+    let mut c = CACHE.lock().unwrap();
+    if c.as_ref().is_none_or(|(t, _)| t.elapsed() > std::time::Duration::from_secs(3)) {
+        let g = RES.lock().unwrap();
+        let mut m = std::collections::HashMap::new();
+        if let Some(res) = g.as_ref() {
+            for (&at, &r) in res.iter() {
+                if crate::gpu::shader::readable(at, 4) {
+                    m.insert(unsafe { (at as *const u32).read_unaligned() }, r);
+                }
+            }
+        }
+        *c = Some((std::time::Instant::now(), m));
+    }
+    c.as_ref()?.1.get(&w0).copied()
+}
+
 /// shared-heap SRV index → the texture on pages its view names (page budget, census). A T#
 /// keeps that index wherever the title copies it, so the slots holding it name the texture.
 static INDEX_RES: Mutex<Option<std::collections::HashMap<u32, usize>>> = Mutex::new(None);
@@ -495,6 +515,10 @@ pub fn referenced() -> (Vec<usize>, Vec<usize>) {
 
 pub fn write(s: &Slot, words: &[u32]) {
     let n = words.len().min(if s.sampler { 4 } else { 8 });
+    if !s.sampler {
+        // lab: the slot no longer holds a view of a depth twin (`real::dev_create_uav_x` notes a new one after this)
+        super::depth_twin::forget_view(s.index);
+    }
     unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), s.at as *mut u32, n) };
 }
 
@@ -508,7 +532,15 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     if src.sampler {
         w[3] = (w[3] & !0xFFF) | (dst.index & 0xFFF);
     } else if w[3] >> 28 >= 8 {
+        // lab: a copied view of a depth twin is still one (`depth_twin`)
+        let twin = super::depth_twin::any().then(|| super::depth_twin::by_word0(w[0])).flatten();
         w[0] = dst.index;
+        write(dst, &w[..n]);
+        if let Some((res, plane)) = twin {
+            super::depth_twin::note_view(dst.index, res, plane);
+        }
+        note_resource(dst, resource_at(src.at).unwrap_or(0));
+        return;
     }
     write(dst, &w[..n]);
     if !src.sampler {

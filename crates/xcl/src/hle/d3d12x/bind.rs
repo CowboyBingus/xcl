@@ -826,11 +826,15 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         Some(b) => ei_peek(this, if gfx { 1 } else { 2 }, max, b.raw(), 0, count_buf, count_off),
         None => ei_peek(this, if gfx { 1 } else { 2 }, max, args, args_off, count_buf, count_off),
     }
+    if gfx {
+        rt_writers_probe(this, pso);
+    }
     if compute && !gfx {
         // lab: indirect dispatches in the probes too (groups: u32::MAX, max count, 0)
         dispatch_probe(this, pso, [u32::MAX, max, 0]);
         rt_dump_note_compute(this);
     }
+    let twins = if compute && !gfx { depth_twins_named(this) } else { Vec::new() };
     let result = bind_abi(this, list, pso, gfx);
     if let Ok(()) = result {
         ei_work(this, sig, super::targets::RAN);
@@ -839,6 +843,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             Some(b) => pc(this, sig, max, b.raw(), 0, count_buf, count_off),
             None => pc(this, sig, max, args, args_off, count_buf, count_off),
         });
+        for (res, plane) in twins {
+            super::list_x::depth_twin_flush(this, res, plane);
+        }
     }
     if let Some(b) = bounded {
         b.finish(list);
@@ -2075,7 +2082,7 @@ unsafe fn dispatch_probe(this: *mut c_void, pso: usize, groups: [u32; 3]) {
         // a table's T# is a copy: its resource is the one of any slot with the same index (word 0)
         let by_index = || {
             let w0 = crate::gpu::shader::readable(slot, 4).then(|| (slot as *const u32).read_unaligned())?;
-            (w0 != 0).then(|| super::console_heap::resource_by_word0(w0)).flatten()
+            (w0 != 0).then(|| super::console_heap::resource_by_word0_cached(w0)).flatten()
         };
         if let Some(r) = super::console_heap::resource_at(slot).or_else(by_index) {
             if !found.iter().any(|x| x.1 == r) {
@@ -2110,6 +2117,49 @@ unsafe fn dispatch_probe(this: *mut c_void, pso: usize, groups: [u32; 3]) {
 /// lab (`XCL_RT_DUMP`): within a second before a dump is due, the textures in the first 64
 /// slots of a compute dispatch's descriptor tables go into the dump as kind `u` (what compute
 /// passes read and write: light lists, probe atlases, volumes), whatever their size.
+/// lab (`depth_twin`): the (depth buffer, plane) pairs whose twin a view in the descriptor tables
+/// of the compute dispatch being bound names (the first 256 slots of each table).
+unsafe fn depth_twins_named(this: *mut c_void) -> Vec<(usize, u32)> {
+    let mut out: Vec<(usize, u32)> = Vec::new();
+    if !super::depth_twin::any() {
+        return out;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return out };
+    let (layout, args, pso) = with(this, |s| (s.layout.clone(), s.args.clone(), s.pso));
+    let Some(layout) = layout else { return out };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    for p in layout.params.iter() {
+        let Param::Table { at } = *p else { continue };
+        let v = word(at as usize).unwrap_or(0);
+        if v == 0 {
+            continue;
+        }
+        let t = u.base() + v as usize;
+        let mut n = 256usize;
+        while n > 0 && !crate::gpu::shader::readable(t, 32 * n) {
+            n /= 2;
+        }
+        for k in 0..n {
+            let d = ((t + 32 * k) as *const [u32; 4]).read_unaligned();
+            // (an image descriptor: type in the top bits of word 3)
+            if d[3] >> 28 < 8 {
+                continue;
+            }
+            if let Some(x) = super::depth_twin::by_word0(d[0]) {
+                if !out.contains(&x) {
+                    out.push(x);
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 40 {
+                        let cs = super::real::pso_shaders(super::pso_async::resolve(pso)).map_or(0, |s| s.0);
+                        crate::xlog_info!("lab: depth twin view of {:#x} plane {} in slot {k} of a table of cs {cs:016x} at {:.1} s", x.0, x.1, crate::log::uptime());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 unsafe fn rt_dump_note_compute(this: *mut c_void) {
     if !super::present::rt_dump_due_soon() {
         return;
@@ -2131,8 +2181,9 @@ unsafe fn rt_dump_note_compute(this: *mut c_void) {
                 break;
             }
             let w0 = (slot as *const u32).read_unaligned();
-            let r = super::console_heap::resource_at(slot).or_else(|| (w0 != 0).then(|| super::console_heap::resource_by_word0(w0)).flatten());
-            if let Some(r) = r {
+            let r = super::console_heap::resource_at(slot).or_else(|| (w0 != 0).then(|| super::console_heap::resource_by_word0_cached(w0)).flatten());
+            // (render targets, depth buffers and UAV textures: not the streamed ones)
+            if let Some(r) = r.filter(|&r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| x.GetDesc().Flags.0 & 7 != 0)) {
                 super::present::note_rt_dump(r, b'u');
             }
         }
@@ -2145,8 +2196,12 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     }
     dispatch_probe(this, pso, [x, y, z]);
     rt_dump_note_compute(this);
+    let twins = depth_twins_named(this);
     bind_abi(this, list, pso, false)?;
     list.Dispatch(x, y, z);
+    for (res, plane) in twins {
+        super::list_x::depth_twin_flush(this, res, plane);
+    }
     Ok(())
 }
 

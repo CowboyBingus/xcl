@@ -16,6 +16,7 @@ pub mod console_list;
 pub mod device_x;
 pub mod dxgi_device;
 mod cpu_writes;
+mod depth_twin;
 mod fence_x;
 mod indirect_clamp;
 pub mod frame;

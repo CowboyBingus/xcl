@@ -760,13 +760,20 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             // A 3-D texture (the colour LUTs): its first slice. A 1x1 / 2x2 target (the exposure) always.
             let shape = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || (kind == b's' && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D);
             let small = d.Width < 128 && d.Width * d.Height as u64 > 4 && kind != b's' && kind != b'u';
-            if !shape || d.SampleDesc.Count > 1 || small || taken >= 300 || bytes > 1500 << 20 {
+            if !shape || d.SampleDesc.Count > 1 || small || taken >= 300 || bytes > 1000 << 20 {
                 crate::xlog_info!("rt dump: {k} {} not copied: dimension {} {}x{} format {} samples {}", kind as char, d.Dimension.0, d.Width, d.Height, d.Format.0, d.SampleDesc.Count);
                 continue;
             }
             if let Some((buffer, footprint)) = readback_copy(&p.list, &res, &d) {
                 taken += 1;
                 bytes += footprint.Footprint.RowPitch as u64 * footprint.Footprint.Height as u64;
+                crate::xlog_info!("rt dump: {k} {} is resource {r:#x} ({}x{} format {})", kind as char, d.Width, d.Height, d.Format.0);
+                // lab: the stencil plane of a D24S8 / D32S8 buffer too (kind + `S`)
+                if matches!(d.Format.0, 19..=22 | 44..=47) && d.MipLevels == 1 && d.DepthOrArraySize == 1 {
+                    if let Some((buffer, footprint)) = readback_copy_sub(&p.list, &res, &d, 1) {
+                        dumps.push(FrameDump { _source: res.clone(), buffer, footprint, format: DXGI_FORMAT_R8_UINT, tag: format!("rtd_{n}_{k:03}_{}S", kind as char) });
+                    }
+                }
                 dumps.push(FrameDump { _source: res, buffer, footprint, format: d.Format, tag: format!("rtd_{n}_{k:03}_{}", kind as char) });
             }
         }
@@ -874,6 +881,11 @@ pub fn last_frame_dump() -> Option<FrameDumpSample> {
 
 /// a copy of subresource 0 of `src` into a new readback buffer, recorded on `list`
 unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+    readback_copy_sub(list, src, desc, 0)
+}
+
+/// lab: `readback_copy` of subresource `sub` (the stencil plane of a depth buffer: its plane 1)
+unsafe fn readback_copy_sub(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC, sub: u32) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let dev: ID3D12Device = {
         let mut d: Option<ID3D12Device> = None;
         src.GetDevice(&mut d).ok()?;
@@ -881,7 +893,7 @@ unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, 
     };
     let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0u64;
-    dev.GetCopyableFootprints(desc, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+    dev.GetCopyableFootprints(desc, sub, 1, 0, Some(&mut fp), None, None, Some(&mut total));
     let mut rb: Option<ID3D12Resource> = None;
     dev.CreateCommittedResource(
         &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
@@ -903,7 +915,7 @@ unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, 
     .ok()?;
     let rb = rb?;
     let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
-    let s = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(src), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+    let s = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(src), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub } };
     list.CopyTextureRegion(&dst, 0, 0, 0, &s, None);
     Some((rb, fp))
 }
@@ -1018,7 +1030,7 @@ pub unsafe fn note_rt_dump(res: usize, kind: u8) {
         return;
     }
     let mut g = RT_DUMP_SET.lock().unwrap();
-    if g.len() >= 700 || g.iter().any(|&(r, _)| r == res) {
+    if g.len() >= 400 || g.iter().any(|&(r, _)| r == res) {
         return;
     }
     add_ref(res);

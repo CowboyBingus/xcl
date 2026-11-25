@@ -3921,6 +3921,30 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
                 b[5] &= !BUFFER_ONLY_STATES;
                 b[6] &= !BUFFER_ONLY_STATES;
             }
+            // lab: a depth buffer with a twin is never in UNORDERED_ACCESS on the PC (DEPTH_WRITE
+            // stands for it, as `device_x::pc_initial_state` does): the twin is, and takes the
+            // depth buffer's contents when the title's state begins, gives them back when it ends
+            // lab (`depth_twin`): a depth buffer with a twin is never in UNORDERED_ACCESS on the
+            // PC (DEPTH_WRITE stands for it, as `device_x::pc_initial_state` does); the state its
+            // barriers leave is kept for the copies into it (`depth_twin_flush`)
+            if super::depth_twin::any() {
+                let res = (b[2] as u64 | (b[3] as u64) << 32) as usize;
+                if super::depth_twin::has(res) {
+                    const DEPTH_WRITE: u32 = 0x10;
+                    for st in [5usize, 6] {
+                        if b[st] & UNORDERED_ACCESS != 0 {
+                            b[st] = DEPTH_WRITE;
+                        }
+                    }
+                    if flags != 1 {
+                        super::depth_twin::set_state(res, b[4], b[6]);
+                    }
+                    static T: AtomicU64 = AtomicU64::new(0);
+                    if T.fetch_add(1, Ordering::Relaxed) < 40 {
+                        crate::xlog_info!("lab: depth twin barrier: {res:#x} subresource {:#x}, {:#x} → {:#x} (console {:#x} → {:#x}), flags {flags:#x}, at {:.1} s", b[4], b[5], b[6], before, after, crate::log::uptime());
+                    }
+                }
+            }
             if b[5] == b[6] {
                 continue;
             }
@@ -3941,6 +3965,68 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     if !out.is_empty() {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
     }
+}
+
+/// lab (`depth_twin`): the twin of (`res`, `plane`) into the depth buffer's plane, recorded on
+/// `list` now (after a compute dispatch that could write the twin). The twin is in
+/// UNORDERED_ACCESS, the depth buffer in the state the title's barriers left (`depth_twin::state`).
+pub(super) unsafe fn depth_twin_flush(list: *mut c_void, res: usize, plane: u32) {
+    let Some(info) = super::depth_twin::info(res, plane) else { return };
+    static N: AtomicU64 = AtomicU64::new(0);
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+    // (depth states are not ones a compute list may name)
+    if tracked_list_type(list).is_some_and(|t| t != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        if SKIPPED.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: depth twin of {res:#x} written on a list that is not a direct one: not copied");
+        }
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    let barrier = |r: usize, sub: u32, before: u32, after: u32| {
+        if before != after {
+            let b: [u32; 8] = [0, 0, r as u32, (r as u64 >> 32) as u32, sub, before, after, 0];
+            pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, PC_RESOURCE_BARRIER)(list, 1, &b);
+        }
+    };
+    let copy = |d: &D3D12_TEXTURE_COPY_LOCATION, s: &D3D12_TEXTURE_COPY_LOCATION| {
+        pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION)(list, d, 0, 0, 0, s, std::ptr::null());
+    };
+    let sub_of = |r: usize, k: u32| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k } };
+    let placed = |r: usize, fp: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+    const ALL: u32 = u32::MAX;
+    const UA: u32 = 0x8;
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    // (a UAV barrier first: the twin's writes are done before it is read)
+    let uav: [u32; 8] = [2, 0, 0, 0, 0, 0, 0, 0];
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, PC_RESOURCE_BARRIER)(list, 1, &uav);
+    barrier(info.twin, ALL, UA, COPY_SOURCE);
+    let states: Vec<u32> = (0..info.subs).map(|k| super::depth_twin::state(res, info.first + k)).collect();
+    if n <= 12 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: depth twin flush #{n}: {res:#x} plane {plane}, {} subresources from {}, in state {:#x}", info.subs, info.first, states[0]);
+    }
+    if info.staging != 0 {
+        // twin → buffer → the plane (a stencil plane takes R8 data from a buffer)
+        let (d, s) = (placed(info.staging, D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, ..info.fp_twin }), sub_of(info.twin, 0));
+        copy(&d, &s);
+        std::mem::forget((d, s));
+        barrier(info.staging, ALL, COPY_DEST, COPY_SOURCE);
+        barrier(res, info.first, states[0], COPY_DEST);
+        let (d, s) = (sub_of(res, info.first), placed(info.staging, D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, ..info.fp_plane }));
+        copy(&d, &s);
+        std::mem::forget((d, s));
+        barrier(res, info.first, COPY_DEST, states[0]);
+        barrier(info.staging, ALL, COPY_SOURCE, COPY_DEST);
+    } else {
+        for k in 0..info.subs {
+            barrier(res, info.first + k, states[k as usize], COPY_DEST);
+            let (d, s) = (sub_of(res, info.first + k), sub_of(info.twin, k));
+            copy(&d, &s);
+            std::mem::forget((d, s));
+            barrier(res, info.first + k, COPY_DEST, states[k as usize]);
+        }
+    }
+    barrier(info.twin, ALL, COPY_SOURCE, UA);
 }
 
 /// D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | INDEX_BUFFER: valid for buffers only

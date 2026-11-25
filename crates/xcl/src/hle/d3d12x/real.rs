@@ -2127,6 +2127,18 @@ fn pc_srv(rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>)
     out.Format = DXGI_FORMAT(f as i32);
     // the PC reads stencil from plane 1; the console's view of it is plane 0 in a stencil format
     if stencil {
+        // lab: and the PC's stencil views (X24_TYPELESS_G8_UINT, X32_TYPELESS_G8X24_UINT) give the
+        // value in the GREEN component – the console's shaders read it as the first one, and got 0.
+        // `XCL_STENCIL_SWIZZLE=0`: as before.
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| !std::env::var("XCL_STENCIL_SWIZZLE").is_ok_and(|v| v.trim() == "0")) {
+            // D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(component 1, component 1, 0, 1)
+            out.Shader4ComponentMapping = 1 | 1 << 3 | 4 << 6 | 5 << 9 | 1 << 12;
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_info!("lab: stencil view (resource format {rf}, view format {f}): the green component is given as the first");
+            }
+        }
         if out.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D {
             out.Anonymous.Texture2D.PlaneSlice = 1;
         } else if out.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY {
@@ -2351,8 +2363,29 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     // call, and the device is removed (0x887A0001)
     let no_uav = ID3D12Resource::from_raw_borrowed(&res).is_some_and(|r| r.GetDesc().Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0);
     let null_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D, ..Default::default() };
+    // lab: such a depth buffer's UAVs are of its twin (`depth_twin`)
+    let twin = if no_uav { super::depth_twin::get_or_make(res, desc.as_ref().map_or(0, |v| v.Format.0)) } else { None };
+    // (a stencil twin is R8_UINT: the view in its format)
+    let twin_desc = desc.as_ref().map(|v| {
+        let mut t = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: if matches!(twin, Some((_, 1))) { windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UINT } else { v.Format }, ..*v };
+        // (the twin has one plane)
+        if t.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D {
+            t.Anonymous.Texture2D.PlaneSlice = 0;
+        } else if t.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY {
+            t.Anonymous.Texture2DArray.PlaneSlice = 0;
+        }
+        if twin.is_some() {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 6 || matches!(twin, Some((_, 1))) {
+                crate::xlog_info!("lab: depth twin view: title's format {} dimension {} mip {} plane {} → format {}", v.Format.0, v.ViewDimension.0, v.Anonymous.Texture2D.MipSlice, v.Anonymous.Texture2D.PlaneSlice, t.Format.0);
+            }
+        }
+        t
+    });
     let pc_uav = |at: u64| {
-        if no_uav {
+        if let Some((t, _)) = twin {
+            f(this, t, std::ptr::null_mut(), twin_desc.as_ref().map_or(desc, |v| v as *const _), at)
+        } else if no_uav {
             static N: AtomicU64 = AtomicU64::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view");
@@ -2412,11 +2445,16 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             srv = v;
         }
         let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
-        g(this, res, &srv, slot.pc_srv);
+        // (a plane-0 twin is read through this slot too; a stencil twin's reads stay on the depth buffer's plane 1)
+        g(this, twin.filter(|t| t.1 == 0).map_or(res, |t| t.0), &srv, slot.pc_srv);
         super::console_heap::publish(&slot, false);
     }
     let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
-    super::console_heap::write(&slot, &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, w, h, d, 1));
+    let words = crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, w, h, d, 1);
+    super::console_heap::write(&slot, &words);
+    if let Some((_, plane)) = twin {
+        super::depth_twin::note_view(words[0], res as usize, plane);
+    }
 }
 
 /// device #127 (a retail game): CreateCommittedResource with a barrier layout in the initial state's place
