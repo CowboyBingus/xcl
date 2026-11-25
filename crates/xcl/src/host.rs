@@ -51,7 +51,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let resident_bytes = |base: usize, size: usize| -> u64 {
                 use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
                 const PAGES: usize = 1 << 16;
-                let mut buf: Vec<PSAPI_WORKING_SET_EX_INFORMATION> = vec![unsafe { std::mem::zeroed() }; PAGES];
+                let mut buf: Vec<PSAPI_WORKING_SET_EX_INFORMATION> = vec![unsafe { std::mem::zeroed() }; PAGES.min(size.div_ceil(4096).max(1))];
                 let (mut n, mut at) = (0u64, base);
                 while at < base + size {
                     let count = PAGES.min((base + size - at) >> 12);
@@ -144,6 +144,55 @@ pub fn host_main(boot_path: &Path) -> i32 {
                         let end = u.base() + (u.shader_windows() << 32);
                         crate::xlog_info!("memory lab: in the working set: {} MB of the 24 GB after the windows ({end:#x}..)", mb(resident_bytes(end, 24 << 30)));
                     }
+                }
+                // lab: every 30 s, the working set by allocation (VirtualQuery over the whole
+                // address space): by kind, and the 16 allocations with most resident bytes
+                // (`XCL_MEM_REGIONS=1`; mapped views are counted as 0)
+                if ticks % 15 == 7 && std::env::var_os("XCL_MEM_REGIONS").is_some() {
+                    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, MEM_MAPPED};
+                    let mut by_base: std::collections::HashMap<usize, (u64, u64, u64, u32)> = std::collections::HashMap::new();
+                    let mut kinds = [0u64; 3];
+                    let mut at = 0x1_0000usize;
+                    while at < 0x7FFF_FFFE_0000 {
+                        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                        if unsafe { VirtualQuery(at as *const _, &mut m, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 || m.RegionSize == 0 {
+                            break;
+                        }
+                        if m.State == MEM_COMMIT {
+                            // not asked of mapped views: asking made 3.4 GB of a 4 GB view some
+                            // other component maps part of the working set (run m6)
+                            let r = if m.Type == MEM_MAPPED { 0 } else { resident_bytes(m.BaseAddress as usize, m.RegionSize) };
+                            let e = by_base.entry(m.AllocationBase as usize).or_insert((0, 0, 0, m.Type));
+                            e.0 += r;
+                            e.1 += m.RegionSize as u64;
+                            e.2 = e.2.max((m.BaseAddress as usize + m.RegionSize - m.AllocationBase as usize) as u64);
+                            kinds[if m.Type == MEM_IMAGE { 0 } else if m.Type == MEM_MAPPED { 1 } else { 2 }] += r;
+                        }
+                        at = m.BaseAddress as usize + m.RegionSize;
+                    }
+                    // allocations by size class: how much of the working set each class holds
+                    let mut classes = [(0u64, 0u32); 6];
+                    for &(r, _, span, _) in by_base.values() {
+                        let c = match span >> 20 {
+                            0 => 0,
+                            1..=15 => 1,
+                            16..=63 => 2,
+                            64..=255 => 3,
+                            256..=1023 => 4,
+                            _ => 5,
+                        };
+                        classes[c].0 += r;
+                        classes[c].1 += 1;
+                    }
+                    let mut v: Vec<(usize, (u64, u64, u64, u32))> = by_base.into_iter().collect();
+                    v.sort_unstable_by_key(|&(_, (r, ..))| std::cmp::Reverse(r));
+                    let top: Vec<String> = v.iter().take(16).map(|&(b, (r, c, span, t))| format!("{b:#x} {} of {} MB committed (span {} MB, {})", mb(r), mb(c), mb(span), if t == MEM_IMAGE { "image" } else if t == MEM_MAPPED { "mapped" } else { "private" })).collect();
+                    crate::xlog_info!(
+                        "memory lab: working set by kind: image {} MB, mapped {} MB, private {} MB; by allocation span: <1 MB {} MB ({}), <16 MB {} MB ({}), <64 MB {} MB ({}), <256 MB {} MB ({}), <1 GB {} MB ({}), larger {} MB ({}); most: {}",
+                        mb(kinds[0]), mb(kinds[1]), mb(kinds[2]),
+                        mb(classes[0].0), classes[0].1, mb(classes[1].0), classes[1].1, mb(classes[2].0), classes[2].1, mb(classes[3].0), classes[3].1, mb(classes[4].0), classes[4].1, mb(classes[5].0), classes[5].1,
+                        top.join("; ")
+                    );
                 }
                 let (evicted, mapped_again) = crate::hle::d3d12x::vram::eviction_counts();
                 if evicted > 0 {
