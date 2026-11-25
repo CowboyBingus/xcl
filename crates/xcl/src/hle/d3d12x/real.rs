@@ -2046,6 +2046,7 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if copy.is_none() {
         copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| default_dsv(&r.GetDesc()));
     }
+    super::present::note_dsv(cpu as usize, res as usize);
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
 }
 
@@ -2321,6 +2322,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     super::present::note_use(res as usize, super::present::USE_UAV);
+    super::present::note_rt_dump(res as usize, b'u');
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
     if super::present::trace_frame() {
         let d = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
@@ -5899,6 +5901,19 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
         if N.fetch_add(1, Ordering::Relaxed) < 12 {
             let first = if n > 0 && !rtvs.is_null() { *rtvs } else { 0 };
             crate::xlog_info!("frame trace: OMSetRenderTargets({n}, first {first:#x} → {:?}, single {single}, dsv {:?})", super::present::rtv_resource(first), dsv.as_ref().copied());
+        }
+    }
+    if super::present::rt_dump_on() {
+        if n > 0 && !rtvs.is_null() {
+            for k in 0..n as usize {
+                let h = if single != 0 { *rtvs + k * 32 } else { *rtvs.add(k) };
+                if let Some(r) = super::present::rtv_resource(h) {
+                    super::present::note_rt_dump(r, b'c');
+                }
+            }
+        }
+        if let Some(r) = dsv.as_ref().and_then(|&h| super::present::dsv_resource(h)) {
+            super::present::note_rt_dump(r, b'd');
         }
     }
     if n > 0 && !rtvs.is_null() {

@@ -1038,7 +1038,18 @@ struct QueueInner {
 
 impl QueueInner {
     fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>) {
-        FAILED.fetch_add(1, Ordering::Relaxed);
+        let nth = FAILED.fetch_add(1, Ordering::Relaxed);
+        // lab diagnostics: every failure of the first 80, then powers of two
+        if nth < 80 || (nth + 1).is_power_of_two() {
+            let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let q = unsafe { VirtualQuery(request.destination as *const c_void, &mut m, std::mem::size_of_val(&m)) };
+            crate::xlog_warn!(
+                "DirectStorage: failure #{nth} ({hr:#x}): options {:#x}, destination {:#x} ({} bytes, page offset {}, phys {}), source size {}, offset {:#x}; region query {q}: base {:#x} size {:#x} state {:#x} protect {:#x}; {}",
+                request.options, request.destination, request.destination_size, request.destination_page_offset, request.dest_physical_pages(), request.source_size, request.offset,
+                m.BaseAddress as usize, m.RegionSize, m.State, m.Protect,
+                file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default()
+            );
+        }
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
         if e.1.is_none() {

@@ -725,6 +725,28 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
         }
     }
+    // lab: `XCL_RT_DUMP` – what the title wrote this frame
+    if let Some(set) = rt_dump_take() {
+        let n = PRESENTS.load(Ordering::Relaxed);
+        crate::xlog_info!("rt dump: present {n} at {:.1} s, {} resources written since the previous present", crate::log::uptime(), set.len());
+        let mut taken = 0;
+        for (k, &(r, kind)) in set.iter().enumerate() {
+            let rr = r as *mut c_void;
+            let Some(res) = ID3D12Resource::from_raw_borrowed(&rr).cloned() else { continue };
+            let d = res.GetDesc();
+            if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count > 1 || d.Width < 128 || taken >= 80 {
+                crate::xlog_info!("rt dump: {k} {} not copied: dimension {} {}x{} format {} samples {}", kind as char, d.Dimension.0, d.Width, d.Height, d.Format.0, d.SampleDesc.Count);
+                continue;
+            }
+            if let Some((buffer, footprint)) = readback_copy(&p.list, &res, &d) {
+                taken += 1;
+                dumps.push(FrameDump { _source: res, buffer, footprint, format: d.Format, tag: format!("rtd_{n}_{k:03}_{}", kind as char) });
+            }
+        }
+        for (r, _) in set {
+            release(r);
+        }
+    }
     let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
     p.list.ResourceBarrier(&b2);
     if p.list.Close().is_err() {
@@ -755,7 +777,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
-                    write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
+                    if dump.tag.starts_with("rtd_") {
+                        write_rt(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
+                    } else {
+                        write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
+                    }
                 }
             }
             Err(e) => {
@@ -908,6 +934,209 @@ fn busiest_rt() -> Option<usize> {
     }
     let single = |r: usize| unsafe { ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| x.GetDesc().SampleDesc.Count <= 1) };
     USES.lock().unwrap().as_ref()?.iter().filter(|(&r, u)| u[USE_RT] > 0 && single(r)).max_by_key(|(_, u)| u[USE_RT]).map(|(&r, _)| r)
+}
+
+// ---------------------------------------------------------------------------------------
+// lab: `XCL_RT_DUMP=t1,t2,…` (seconds of uptime) – at the first present after each time, every
+// single-sampled 2-D texture bound as a render target / depth buffer or given a UAV since the
+// previous present is copied (mip 0) and written to the logs folder as
+// `rtd_<present>_<k>_<kind>_<w>x<h>_f<format>.bmp`, with a log line of its statistics.
+// The contents are what the texture holds at the present, not right after the pass.
+// ---------------------------------------------------------------------------------------
+
+fn rt_dump_times() -> &'static [f64] {
+    static T: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::env::var("XCL_RT_DUMP").unwrap_or_default().split(',').filter_map(|v| v.trim().parse().ok()).collect())
+}
+
+pub fn rt_dump_on() -> bool {
+    !rt_dump_times().is_empty()
+}
+
+/// (resource, kind) in first-use order, AddRef'd until the next present
+static RT_DUMP_SET: Mutex<Vec<(usize, u8)>> = Mutex::new(Vec::new());
+/// DSV handle → resource (not AddRef'd: looked at only while the title binds it)
+static DSVS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+static RT_DUMPS_DONE: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_dsv(handle: usize, res: usize) {
+    if rt_dump_on() {
+        DSVS.lock().unwrap().get_or_insert_with(HashMap::new).insert(handle, res);
+    }
+}
+
+pub fn dsv_resource(handle: usize) -> Option<usize> {
+    DSVS.lock().unwrap().as_ref()?.get(&handle).copied()
+}
+
+/// `res` was written this frame (kind b'c' colour target, b'd' depth, b'u' UAV)
+pub unsafe fn note_rt_dump(res: usize, kind: u8) {
+    if !rt_dump_on() || res == 0 {
+        return;
+    }
+    let mut g = RT_DUMP_SET.lock().unwrap();
+    if g.len() >= 256 || g.iter().any(|&(r, _)| r == res) {
+        return;
+    }
+    add_ref(res);
+    g.push((res, kind));
+}
+
+/// The set of this frame (the caller releases them) when a dump is due now, else None (the
+/// set is released).
+unsafe fn rt_dump_take() -> Option<Vec<(usize, u8)>> {
+    if !rt_dump_on() {
+        return None;
+    }
+    let set = std::mem::take(&mut *RT_DUMP_SET.lock().unwrap());
+    let done = RT_DUMPS_DONE.load(Ordering::Relaxed) as usize;
+    let due = rt_dump_times().get(done).is_some_and(|&t| crate::log::uptime() >= t);
+    if !due {
+        for (r, _) in set {
+            release(r);
+        }
+        return None;
+    }
+    RT_DUMPS_DONE.fetch_add(1, Ordering::Relaxed);
+    Some(set)
+}
+
+fn half(v: u16) -> f32 {
+    let (s, e, m) = (v >> 15, (v >> 10) & 31, (v & 1023) as f32 / 1024.0);
+    let x = match e {
+        0 => m * 2f32.powi(-14),
+        31 => 65504.0,
+        _ => (1.0 + m) * 2f32.powi(e as i32 - 15),
+    };
+    if s != 0 { -x } else { x }
+}
+
+/// (bytes per texel, decoder to RGB floats in 0..1 for viewing) of a footprint format
+fn rt_decoder(format: DXGI_FORMAT) -> Option<(usize, fn(&[u8]) -> [f32; 3])> {
+    fn tm(v: f32) -> f32 {
+        let v = v.abs();
+        (v / (1.0 + v)).sqrt()
+    }
+    fn f(b: &[u8], at: usize) -> f32 {
+        f32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+    fn h(b: &[u8], at: usize) -> f32 {
+        half(u16::from_le_bytes([b[at], b[at + 1]]))
+    }
+    fn u(b: &[u8]) -> u32 {
+        u32::from_le_bytes(b[0..4].try_into().unwrap())
+    }
+    Some(match format.0 {
+        // R32G32B32A32
+        1..=4 => (16, |b| [tm(f(b, 0)), tm(f(b, 4)), tm(f(b, 8))]),
+        // R16G16B16A16 (float; typeless as float)
+        9 | 10 => (8, |b| [tm(h(b, 0)), tm(h(b, 2)), tm(h(b, 4))]),
+        11..=14 => (8, |b| [b[1] as f32 / 255.0, b[3] as f32 / 255.0, b[5] as f32 / 255.0]),
+        // R32G32
+        15..=18 => (8, |b| [tm(f(b, 0)), tm(f(b, 4)), 0.0]),
+        // R10G10B10A2
+        23..=25 => (4, |b| {
+            let t = u(b);
+            [(t & 1023) as f32 / 1023.0, (t >> 10 & 1023) as f32 / 1023.0, (t >> 20 & 1023) as f32 / 1023.0]
+        }),
+        26 => (4, |b| {
+            let t = u(b);
+            [tm(small_float(t & 0x7FF, 6)), tm(small_float(t >> 11 & 0x7FF, 6)), tm(small_float(t >> 22, 5))]
+        }),
+        // R8G8B8A8
+        27..=32 => (4, |b| [b[0] as f32 / 255.0, b[1] as f32 / 255.0, b[2] as f32 / 255.0]),
+        // R16G16
+        33 | 34 => (4, |b| [tm(h(b, 0)), tm(h(b, 2)), 0.0]),
+        35..=38 => (4, |b| [b[1] as f32 / 255.0, b[3] as f32 / 255.0, 0.0]),
+        // R32 float / depth: values in 0..1 spread near 0 (reversed Z)
+        39..=41 => (4, |b| {
+            let v = f(b, 0);
+            let g = if (0.0..=1.0).contains(&v) { v.powf(0.25) } else { tm(v) };
+            [g, g, g]
+        }),
+        42 | 43 => (4, |b| {
+            let t = u(b).wrapping_mul(0x9E37_79B1);
+            [(t >> 24) as f32 / 255.0, (t >> 16 & 255) as f32 / 255.0, (t >> 8 & 255) as f32 / 255.0]
+        }),
+        // R24G8
+        44..=47 => (4, |b| [((u(b) & 0xFF_FFFF) as f32 / 16_777_215.0).powf(0.25); 3]),
+        // R8G8
+        48..=52 => (2, |b| [b[0] as f32 / 255.0, b[1] as f32 / 255.0, 0.0]),
+        // R16
+        53 | 54 => (2, |b| [tm(h(b, 0)); 3]),
+        55..=59 => (2, |b| [u16::from_le_bytes([b[0], b[1]]) as f32 / 65535.0; 3]),
+        // R8 / A8
+        60..=65 => (1, |b| [b[0] as f32 / 255.0; 3]),
+        // B8G8R8A8 / X8
+        87 | 88 | 90..=93 => (4, |b| [b[2] as f32 / 255.0, b[1] as f32 / 255.0, b[0] as f32 / 255.0]),
+        _ => return None,
+    })
+}
+
+unsafe fn write_rt(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, format: DXGI_FORMAT, tag: &str) {
+    let (w, h, pitch) = (fp.Footprint.Width as usize, fp.Footprint.Height as usize, fp.Footprint.RowPitch as usize);
+    let n = PRESENTS.load(Ordering::Relaxed);
+    let Some((bytes, decode)) = rt_decoder(fp.Footprint.Format).or_else(|| rt_decoder(format)) else {
+        crate::xlog_info!("rt dump: {tag} at present {n} ({w}x{h}, format {} / footprint {}): format not decoded", format.0, fp.Footprint.Format.0);
+        return;
+    };
+    let mut p: *mut c_void = std::ptr::null_mut();
+    if rb.Map(0, None, Some(&mut p)).is_err() || p.is_null() {
+        return;
+    }
+    let step = w.div_ceil(960).max(1);
+    let (ow, oh) = ((w / step).max(1), (h / step).max(1));
+    let row = (ow * 3).div_ceil(4) * 4;
+    let mut bmp = Vec::with_capacity(54 + row * oh);
+    bmp.extend_from_slice(b"BM");
+    for v in [(54 + row * oh) as u32, 0, 54, 40, ow as u32, oh as u32] {
+        bmp.extend_from_slice(&v.to_le_bytes());
+    }
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&24u16.to_le_bytes());
+    for _ in 0..6 {
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+    }
+    let mut raw: HashMap<Vec<u8>, usize> = HashMap::new();
+    let (mut sum, mut alpha_sum, mut alpha_n) = ([0f64; 3], 0f64, 0usize);
+    for y in (0..oh).rev() {
+        let start = bmp.len();
+        for x in 0..ow {
+            let t = std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + step * y * pitch + bytes * step * x), bytes);
+            if raw.len() < 100_000 || raw.contains_key(t) {
+                *raw.entry(t.to_vec()).or_default() += 1;
+            }
+            let c = decode(t);
+            for k in 0..3 {
+                sum[k] += c[k] as f64;
+            }
+            if matches!(fp.Footprint.Format.0, 27..=32) {
+                alpha_sum += t[3] as f64;
+                alpha_n += 1;
+            }
+            let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
+            bmp.extend_from_slice(&[q(c[2]), q(c[1]), q(c[0])]);
+        }
+        bmp.resize(start + row, 0);
+    }
+    rb.Unmap(0, None);
+    let Some(boot) = crate::state::boot() else { return };
+    let path = boot.logs_dir().join(format!("{tag}_{w}x{h}_f{}.bmp", format.0));
+    let _ = std::fs::write(&path, &bmp);
+    let px = (ow * oh) as f64;
+    let mut top: Vec<(Vec<u8>, usize)> = raw.into_iter().collect();
+    let distinct = top.len();
+    top.sort_by_key(|x| std::cmp::Reverse(x.1));
+    crate::xlog_info!(
+        "rt dump: {tag} at present {n} ({w}x{h}, format {}): mean rgb {:.3} {:.3} {:.3}{}, {distinct} distinct texels of {}, most common: {}",
+        format.0,
+        sum[0] / px,
+        sum[1] / px,
+        sum[2] / px,
+        if alpha_n > 0 { format!(" alpha {:.1}", alpha_sum / alpha_n as f64) } else { String::new() },
+        ow * oh,
+        top.iter().take(4).map(|(v, c)| format!("{}×{c}", v.iter().rev().map(|b| format!("{b:02x}")).collect::<String>())).collect::<Vec<_>>().join(" ")
+    );
 }
 
 /// an 11- / 10-bit unsigned float (5-bit exponent) -> f32
