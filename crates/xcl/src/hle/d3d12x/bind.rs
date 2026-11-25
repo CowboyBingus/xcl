@@ -651,8 +651,40 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 None => (args, args_off),
             };
             ei_peek(this, 0, max, args, args_off + u64::from(msig.mesh_offset), count_buf, count_off);
+            // lab: the groups of a single record as the CPU sees them now (a record the GPU
+            // writes later may differ): the record buffer is made for them when they need more
+            // than `RES_BYTES` (unbounded, the compute pass wrote past a smaller buffer)
+            let cpu_groups = if unbounded && max == 1 && count_buf == 0 {
+                super::real::console_buffer(args).and_then(|(p, len)| {
+                    let o = console_args_off as usize + msig.mesh_offset as usize;
+                    (o + 12 <= len && crate::gpu::shader::readable(p + o, 12)).then(|| ((p + o) as *const [u32; 3]).read_unaligned())
+                })
+            } else {
+                None
+            };
+            let cpu_need = cpu_groups.map_or(0, |g| u64::from(g[0]).saturating_mul(u64::from(g[1].max(1))).saturating_mul(u64::from(g[2].max(1))).saturating_mul(rec_bytes));
+            {
+                static SEEN: AtomicU64 = AtomicU64::new(0);
+                static UNKNOWN: AtomicU64 = AtomicU64::new(0);
+                static OVER: AtomicU64 = AtomicU64::new(0);
+                static MOST: AtomicU64 = AtomicU64::new(0);
+                let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+                if cpu_groups.is_none() {
+                    UNKNOWN.fetch_add(1, Ordering::Relaxed);
+                }
+                if cpu_need > RES_BYTES {
+                    OVER.fetch_add(1, Ordering::Relaxed);
+                }
+                let most = MOST.fetch_max(cpu_need, Ordering::Relaxed).max(cpu_need);
+                if n.is_power_of_two() || (cpu_need > RES_BYTES && cpu_need == most) {
+                    crate::xlog_info!(
+                        "D3D12.X: two-pass EI records on the CPU: {n} calls, {} not readable, {} need more than {} MiB, most {} KiB (this one {:x?}, record {} B)",
+                        UNKNOWN.load(Ordering::Relaxed), OVER.load(Ordering::Relaxed), RES_BYTES >> 20, most >> 10, cpu_groups, rec_bytes
+                    );
+                }
+            }
             let run = (|| -> Result<(), String> {
-                let (res_buf, res_va) = ensure_res_buffer(this, RES_BYTES)?;
+                let (res_buf, res_va) = ensure_res_buffer(this, RES_BYTES.max(cpu_need))?;
                 ms_probe(this, "EI", &tp, max);
                 bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
                 // both passes read the records a dispatch before them wrote (the title's own, or
