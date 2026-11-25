@@ -2454,6 +2454,8 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     super::console_heap::write(&slot, &words);
     if let Some((_, plane)) = twin {
         super::depth_twin::note_view(words[0], res as usize, plane);
+    } else if super::depth_twin::is_alias_src(res as usize) {
+        super::depth_twin::note_view(words[0], res as usize, 2);
     }
 }
 

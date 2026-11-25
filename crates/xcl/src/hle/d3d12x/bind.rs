@@ -826,6 +826,28 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         Some(b) => ei_peek(this, if gfx { 1 } else { 2 }, max, b.raw(), 0, count_buf, count_off),
         None => ei_peek(this, if gfx { 1 } else { 2 }, max, args, args_off, count_buf, count_off),
     }
+    // lab (`XCL_EI_PEEK`): the first 3 calls of each pipeline with its shader (PS / CS record hash)
+    if ei_peek_from().is_some_and(|t| crate::log::uptime() >= t) {
+        if let Some((a, b)) = super::real::pso_shaders(pso) {
+            let hash = if gfx { b } else { a };
+            static SEEN: Mutex<Option<HashMap<u64, u32>>> = Mutex::new(None);
+            let n = {
+                let mut g = SEEN.lock().unwrap();
+                let n = g.get_or_insert_with(HashMap::new).entry(hash).or_insert(0);
+                *n += 1;
+                *n
+            };
+            if n <= 3 {
+                let slot = match &bounded {
+                    Some(b) => ei_peek_slot(this, if gfx { 20 } else { 21 }, max, b.raw(), 0, count_buf, count_off),
+                    None => ei_peek_slot(this, if gfx { 20 } else { 21 }, max, args, args_off, count_buf, count_off),
+                };
+                if let Some(slot) = slot {
+                    EI_NAMED.lock().unwrap().push((slot, hash, gfx));
+                }
+            }
+        }
+    }
     if gfx {
         rt_writers_probe(this, pso);
     }
@@ -1166,6 +1188,10 @@ unsafe fn ms_probe(this: *mut c_void, what: &str, tp: &super::real::TwoPassPso, 
 }
 
 
+/// lab: (peek slot, PS / CS record hash, graphics) of the calls peeked by pipeline
+static EI_NAMED: Mutex<Vec<(usize, u64, bool)>> = Mutex::new(Vec::new());
+static EI_NAMED_DONE: AtomicU64 = AtomicU64::new(0);
+
 fn ei_peek_report() {
     let g = EI_PEEK.lock().unwrap();
     let Some(pk) = g.as_ref() else { return };
@@ -1175,6 +1201,20 @@ fn ei_peek_report() {
             return;
         }
         let w = |slot: usize, k: usize| (p as *const u32).add(slot * 8 + k).read_unaligned();
+        {
+            let named = EI_NAMED.lock().unwrap();
+            let from = EI_NAMED_DONE.load(Ordering::Relaxed) as usize;
+            let mut done = from;
+            for &(slot, hash, gfx) in named.iter().skip(from) {
+                if w(slot, 0) == 0xEEEE_EEEE {
+                    break;
+                }
+                done += 1;
+                let (t, _, max, has_count) = pk.meta[slot];
+                crate::xlog_info!("ei named: {} {hash:016x} at {t:.1} s: max {max} [{} {} {}]{}", if gfx { "ps" } else { "cs" }, w(slot, 0), w(slot, 1), w(slot, 2), if has_count { format!(" count {}", w(slot, 4)) } else { String::new() });
+            }
+            EI_NAMED_DONE.store(done as u64, Ordering::Relaxed);
+        }
         // (kind, 4 s bucket) -> (calls, not run yet, empty arguments, count 0, work, examples)
         let mut rows: std::collections::BTreeMap<(u8, u64), (u32, u32, u32, u32, u64, Vec<String>)> = Default::default();
         for (slot, &(t, kind, max, has_count)) in pk.meta.iter().enumerate() {
@@ -1196,7 +1236,7 @@ fn ei_peek_report() {
                 row.4 += x as u64 * if kind == 1 { y as u64 } else { y as u64 * z as u64 };
             }
             if row.5.len() < if kind >= 4 { 48 } else { 10 } && (!empty || row.0 % 97 == 1 || kind >= 4) {
-                if matches!(kind, 5..=7 | 9..=11) {
+                if matches!(kind, 5..=7 | 9..=11 | 30..=32) {
                     row.5.push(format!("({:.4e} {:.4e} {:.4e} {:.4e})", f32::from_bits(x), f32::from_bits(y), f32::from_bits(z), f32::from_bits(c)));
                 } else {
                     row.5.push(format!("max {max} [{x:#x} {y:#x} {z:#x}]{}", if has_count { format!(" count {c:#x}") } else { String::new() }));
@@ -1991,6 +2031,19 @@ unsafe fn post_probe(this: *mut c_void, pso: usize) {
     };
     let rt = super::present::rt0_resource(this as usize).and_then(|r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0) }));
     crate::xlog_info!("post probe: vs {vs:016x} ps {ps:016x} into {rt:?} at {:.1} s: s8 {:#x} s9 {:#x}; pre-exposure (s8+0x80) {}; frame constants (s8+0xc0) {}", crate::log::uptime(), word(0), word(1), buffer(t0 + 0x80, 0, 4), buffer(t0 + 0xc0, 0x5f0, 1));
+    // lab (with `XCL_EI_PEEK`): the same buffers as the GPU holds them (the CPU does not see GPU
+    // writes into shadowed unified memory): 12 bytes each, logged by `ei_peek_report` as kind
+    // 30 (pre-exposure, s8 + 0x80), 31 (s9 + 0x0), 32 (the curve, s9 + 0x20)
+    if ei_peek_from().is_some() {
+        for (kind, slot) in [(30u8, t0 + 0x80), (31, t1), (32, t1 + 0x20)] {
+            let Some(w) = cpu(slot, 4) else { continue };
+            let a = (u64::from(w[1] & 0xFFFF) << 32) | u64::from(w[0]);
+            let p = if a >> 32 == 0 { u.base() + a as usize } else { a as usize };
+            if let Some((win, at)) = super::real::uma_window_buffer(p, 16) {
+                ei_peek_slot(this, kind, 0, win, at, 0, 0);
+            }
+        }
+    }
     let cb = t1 + 0x540;
     crate::xlog_info!(
         "post probe: constants {} | +0x40 {} | +0x220 {} | +0x3c0 {} | +0x3e0 {} | +0x400 {} | +0x480 {} | +0x500 {}",
@@ -2175,7 +2228,7 @@ unsafe fn rt_dump_note_compute(this: *mut c_void) {
             continue;
         }
         let t = u.base() + v as usize;
-        for k in 0..64usize {
+        for k in 0..128usize {
             let slot = t + 32 * k;
             if !crate::gpu::shader::readable(slot, 32) {
                 break;
@@ -2183,7 +2236,7 @@ unsafe fn rt_dump_note_compute(this: *mut c_void) {
             let w0 = (slot as *const u32).read_unaligned();
             let r = super::console_heap::resource_at(slot).or_else(|| (w0 != 0).then(|| super::console_heap::resource_by_word0_cached(w0)).flatten());
             // (render targets, depth buffers and UAV textures: not the streamed ones)
-            if let Some(r) = r.filter(|&r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| x.GetDesc().Flags.0 & 7 != 0)) {
+            if let Some(r) = r.filter(|&r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| { let d = x.GetDesc(); d.Flags.0 & 7 != 0 || d.Format.0 == 67 })) {
                 super::present::note_rt_dump(r, b'u');
             }
         }

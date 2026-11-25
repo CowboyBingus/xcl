@@ -199,3 +199,120 @@ pub fn state(res: usize, sub: u32) -> u32 {
     let g = STATES.lock().unwrap();
     g.as_ref().and_then(|m| m.get(&(res, sub)).or_else(|| m.get(&(res, u32::MAX))).copied()).unwrap_or(0x10)
 }
+
+// ---------------------------------------------------------------------------------------
+// lab: alias pairs. The retail title places an R32_UINT texture with ALLOW_UNORDERED_ACCESS and
+// an R9G9B9E5 texture without flags at ONE address: compute writes packed RGB9E5 through the
+// UAV, shaders sample the other (its screen-probe radiance atlases, 2048x512 / 2304x576 ...).
+// At an address that is not 64 KiB aligned the UAV texture becomes a committed resource
+// (`vram::place` takes only aligned ones) and the sampled one a reserved texture on pages
+// (`vram::place_pages`): two memories, the sampled view never sees the writes. Here the pair is
+// remembered and the UAV texture is copied into the other (through a buffer: the formats are not
+// castable) after each compute dispatch that names its UAV (`list_x::depth_twin_flush`, plane 2).
+// `XCL_ALIAS_COPY=0`: off.
+// ---------------------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct AliasInfo {
+    pub dst: usize,
+    pub staging: usize,
+    pub src_fp: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    pub dst_fp: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+}
+
+struct Alias {
+    _src: ID3D12Resource,
+    _dst: ID3D12Resource,
+    _staging: ID3D12Resource,
+    info: AliasInfo,
+}
+unsafe impl Send for Alias {}
+
+/// title address → the GPU-owned R32_UINT UAV texture placed there last
+static ALIAS_SRC: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+/// UAV texture → its pair
+static ALIASES: Mutex<Option<HashMap<usize, Alias>>> = Mutex::new(None);
+
+fn alias_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("XCL_ALIAS_COPY").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// A GPU-owned texture was placed at title address `va`.
+pub unsafe fn alias_note_gpu_owned(va: usize, res: *mut c_void) {
+    if !alias_on() {
+        return;
+    }
+    let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else { return };
+    let d = r.GetDesc();
+    let mut g = ALIAS_SRC.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if d.Format == DXGI_FORMAT_R32_UINT && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0 && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        m.insert(va, res as usize);
+    } else {
+        m.remove(&va);
+    }
+}
+
+/// A texture without flags was placed at `va`: paired with the R32_UINT UAV texture there when it
+/// is an R9G9B9E5 one of the same shape and the two do not share memory.
+pub unsafe fn alias_pair(va: usize, res: *mut c_void) {
+    if !alias_on() {
+        return;
+    }
+    let Some(&src) = ALIAS_SRC.lock().unwrap().as_ref().and_then(|m| m.get(&va)) else { return };
+    let src_raw = src as *mut c_void;
+    let (Some(d), Some(s)) = (ID3D12Resource::from_raw_borrowed(&res), ID3D12Resource::from_raw_borrowed(&src_raw)) else { return };
+    let (dd, sd) = (d.GetDesc(), s.GetDesc());
+    if dd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || (dd.Width, dd.Height, dd.DepthOrArraySize, dd.MipLevels) != (sd.Width, sd.Height, sd.DepthOrArraySize, sd.MipLevels) {
+        return;
+    }
+    // both reserved on the pages of the address: one memory already
+    if va % 0x1_0000 == 0 {
+        return;
+    }
+    let mut dev: Option<ID3D12Device> = None;
+    if s.GetDevice(&mut dev).is_err() {
+        return;
+    }
+    let Some(dev) = dev else { return };
+    let n = sd.MipLevels as u32 * sd.DepthOrArraySize as u32;
+    let mut src_fp = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize];
+    let mut dst_fp = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize];
+    let (mut src_total, mut dst_total) = (0u64, 0u64);
+    dev.GetCopyableFootprints(&sd, 0, n, 0, Some(src_fp.as_mut_ptr()), None, None, Some(&mut src_total));
+    dev.GetCopyableFootprints(&dd, 0, n, 0, Some(dst_fp.as_mut_ptr()), None, None, Some(&mut dst_total));
+    if src_total == 0 || src_total != dst_total || src_fp.iter().zip(&dst_fp).any(|(a, b)| a.Offset != b.Offset || a.Footprint.RowPitch != b.Footprint.RowPitch) {
+        crate::xlog_warn!("D3D12.X: alias pair at {va:#x}: footprints differ ({src_total} / {dst_total} bytes)");
+        return;
+    }
+    let bd = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: src_total,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut staging: Option<ID3D12Resource> = None;
+    let made = dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut staging);
+    let Some(staging) = staging.filter(|_| made.is_ok()) else { return };
+    let info = AliasInfo { dst: res as usize, staging: staging.as_raw() as usize, src_fp, dst_fp };
+    let mut g = ALIASES.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    m.insert(src, Alias { _src: s.clone(), _dst: d.clone(), _staging: staging, info });
+    ANY.store(true, Ordering::Relaxed);
+    crate::xlog_info!("D3D12.X: alias pair #{} at {va:#x}: R32_UINT UAV texture {src:#x} → R9G9B9E5 texture {res:p}, {}x{}, {} mips ({} KiB a copy)", m.len(), sd.Width, sd.Height, sd.MipLevels, src_total >> 10);
+}
+
+/// Whether `res` is an R32_UINT UAV texture placed in title memory (it may be, or become, the
+/// UAV texture of an alias pair: its UAVs are followed).
+pub fn is_alias_src(res: usize) -> bool {
+    alias_on() && ALIAS_SRC.lock().unwrap().as_ref().is_some_and(|m| m.values().any(|&r| r == res))
+}
+
+pub fn alias_info(res: usize) -> Option<AliasInfo> {
+    ALIASES.lock().unwrap().as_ref()?.get(&res).map(|a| a.info.clone())
+}

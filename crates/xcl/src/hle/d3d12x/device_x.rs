@@ -923,6 +923,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                         super::title_textures::retire_overlapping(va as usize, bytes as usize);
                     }
                     real::note_title_address(*ppv as usize, va as usize);
+                    super::depth_twin::alias_note_gpu_owned(va as usize, *ppv);
                 }
                 return hr;
             }
@@ -937,6 +938,15 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv)
         }
     };
+    // lab (`depth_twin`, alias pairs): a GPU-owned texture that became a resource of its own, and a
+    // texture without flags placed where such a one is
+    if hr >= 0 && !buffer && !(*ppv).is_null() {
+        if super::vram::gpu_owned(flags) {
+            super::depth_twin::alias_note_gpu_owned(va as usize, *ppv);
+        } else {
+            super::depth_twin::alias_pair(va as usize, *ppv);
+        }
+    }
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {

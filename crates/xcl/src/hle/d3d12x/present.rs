@@ -1120,6 +1120,12 @@ fn rt_decoder(format: DXGI_FORMAT) -> Option<(usize, fn(&[u8]) -> [f32; 3])> {
         // R16
         53 | 54 => (2, |b| [tm(h(b, 0)); 3]),
         55..=59 => (2, |b| [u16::from_le_bytes([b[0], b[1]]) as f32 / 65535.0; 3]),
+        // lab: R9G9B9E5_SHAREDEXP
+        67 => (4, |b| {
+            let t = u(b);
+            let e = 2f32.powi((t >> 27) as i32 - 24);
+            [tm((t & 511) as f32 * e), tm((t >> 9 & 511) as f32 * e), tm((t >> 18 & 511) as f32 * e)]
+        }),
         // R8 / A8
         60..=65 => (1, |b| [b[0] as f32 / 255.0; 3]),
         // B8G8R8A8 / X8
@@ -1155,7 +1161,7 @@ unsafe fn write_rt(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     let mut raw: HashMap<Vec<u8>, usize> = HashMap::new();
     let (mut sum, mut alpha_sum, mut alpha_n) = ([0f64; 3], 0f64, 0usize);
     // lab: for the float formats, the luminance of each sampled texel with the view curve undone
-    let hdr = matches!(fp.Footprint.Format.0, 1..=4 | 9 | 10 | 26);
+    let hdr = matches!(fp.Footprint.Format.0, 1..=4 | 9 | 10 | 26 | 67);
     let mut lum: Vec<f32> = Vec::new();
     for y in (0..oh).rev() {
         let start = bmp.len();

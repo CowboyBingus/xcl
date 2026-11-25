@@ -3971,6 +3971,9 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
 /// `list` now (after a compute dispatch that could write the twin). The twin is in
 /// UNORDERED_ACCESS, the depth buffer in the state the title's barriers left (`depth_twin::state`).
 pub(super) unsafe fn depth_twin_flush(list: *mut c_void, res: usize, plane: u32) {
+    if plane == 2 {
+        return alias_flush(list, res);
+    }
     let Some(info) = super::depth_twin::info(res, plane) else { return };
     static N: AtomicU64 = AtomicU64::new(0);
     static SKIPPED: AtomicU64 = AtomicU64::new(0);
@@ -4027,6 +4030,38 @@ pub(super) unsafe fn depth_twin_flush(list: *mut c_void, res: usize, plane: u32)
         }
     }
     barrier(info.twin, ALL, COPY_SOURCE, UA);
+}
+
+/// lab (`depth_twin`, alias pairs): the R32_UINT UAV texture `res` into the R9G9B9E5 texture the
+/// title placed at its address, every subresource, through the pair's buffer. No transitions of
+/// the two textures: the title owns their states (the UAV texture is being written as one, the
+/// other is a sampled texture).
+unsafe fn alias_flush(list: *mut c_void, res: usize) {
+    let Some(info) = super::depth_twin::alias_info(res) else { return };
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: alias copy #{n}: {res:#x} → {:#x}, {} subresources", info.dst, info.src_fp.len());
+    }
+    let copy = |d: &D3D12_TEXTURE_COPY_LOCATION, s: &D3D12_TEXTURE_COPY_LOCATION| {
+        pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION)(list, d, 0, 0, 0, s, std::ptr::null());
+    };
+    let sub_of = |r: usize, k: u32| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k } };
+    let placed = |r: usize, fp: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+    let uav: [u32; 8] = [2, 0, 0, 0, 0, 0, 0, 0];
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, PC_RESOURCE_BARRIER)(list, 1, &uav);
+    for (k, fp) in info.src_fp.iter().enumerate() {
+        let (d, s) = (placed(info.staging, *fp), sub_of(res, k as u32));
+        copy(&d, &s);
+        std::mem::forget((d, s));
+    }
+    transition(list, info.staging, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    for (k, fp) in info.dst_fp.iter().enumerate() {
+        let (d, s) = (sub_of(info.dst, k as u32), placed(info.staging, *fp));
+        copy(&d, &s);
+        std::mem::forget((d, s));
+    }
+    transition(list, info.staging, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
 }
 
 /// D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | INDEX_BUFFER: valid for buffers only
