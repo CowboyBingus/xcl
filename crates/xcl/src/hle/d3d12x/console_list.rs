@@ -354,6 +354,10 @@ pub fn allocator_reset(allocator: *mut c_void) {
         unsafe { free_uma(&b) };
     }
     super::bind::release_allocator_res(allocator as usize);
+    // the bounded ExecuteIndirect copies too: `alloc_pool` comes here for the PC allocators it
+    // put aside, and their copies were never given back (1 MiB buffers at 2 a second in a
+    // retail title's world: 154 MB -> 538 MB in two minutes)
+    super::indirect_clamp::allocator_reset(allocator as usize);
 }
 
 fn with_list<R>(obj: usize, f: impl FnOnce(&mut ListState) -> R) -> Option<R> {
