@@ -783,6 +783,80 @@ pub(super) fn drawn(res: &[usize]) {
     DRAWN.lock().unwrap().extend(back);
 }
 
+/// Slots of a bound descriptor table looked at (`tables_drawn`): a table's length is not in the
+/// root signature the title gives, and an image T# read past its end keeps one more texture at worst.
+const TABLE_SLOTS: usize = 16;
+/// How often one table (by address) is looked at.
+const TABLE_LOOK_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Page budget (`XCL_TABLE_TOUCH=0`: not): a draw or dispatch being recorded binds the
+/// descriptor tables at the CPU addresses `tables`; the textures whose image T#s are in their
+/// first `TABLE_SLOTS` slots are sampled (`drawn`: recent, and mapped again at the next submit
+/// when the page budget evicted them). A texture that is only sampled through a table gets no
+/// transition and no CPU write: the loading screen's artwork (Scaleform draws) was evicted
+/// while on screen and read as zeros – a black banner with only the flat vector shapes over
+/// it. Each table is looked at once in `TABLE_LOOK_EVERY`.
+pub(super) fn tables_drawn(tables: &[usize]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if tables.is_empty() || !*ON.get_or_init(|| !std::env::var("XCL_TABLE_TOUCH").is_ok_and(|v| v.trim() == "0")) || !super::vram::tracking() {
+        return;
+    }
+    static LOOKED: Mutex<Option<std::collections::HashMap<usize, std::time::Instant>>> = Mutex::new(None);
+    let due: Vec<usize> = {
+        let now = std::time::Instant::now();
+        let mut g = LOOKED.lock().unwrap();
+        let m = g.get_or_insert_with(Default::default);
+        tables.iter().copied().filter(|&at| table_look_due(m, at, now)).collect()
+    };
+    let mut named = Vec::new();
+    for at in due {
+        for res in table_textures(at, TABLE_SLOTS, super::console_heap::index_resource) {
+            if !named.contains(&res) {
+                named.push(res);
+            }
+        }
+    }
+    drawn(&named);
+}
+
+/// Whether the table at `at` is looked at now (`last`: when each table was; forgotten
+/// wholesale past 65536 of them).
+fn table_look_due(last: &mut std::collections::HashMap<usize, std::time::Instant>, at: usize, now: std::time::Instant) -> bool {
+    if at == 0 || last.get(&at).is_some_and(|&t| now.duration_since(t) < TABLE_LOOK_EVERY) {
+        return false;
+    }
+    if last.len() >= 1 << 16 {
+        last.clear();
+    }
+    last.insert(at, now);
+    true
+}
+
+/// The resources the image T#s in the first `slots` 32-byte slots at CPU address `at` name:
+/// word 0 of an image T# (type, word 3 [31:28], 8 or more – as `console_heap::referenced` tells
+/// one) is its shared-heap index, which `resolve` turns into a texture. Buffer V#s, empty slots
+/// and memory that cannot be read name none; no repeats.
+fn table_textures(at: usize, slots: usize, resolve: impl Fn(u32) -> Option<usize>) -> Vec<usize> {
+    let n = slots * 8;
+    if !crate::gpu::shader::readable(at, 4 * n) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for k in 0..slots {
+        let w = |i: usize| unsafe { ((at + 32 * k + 4 * i) as *const u32).read_unaligned() };
+        let (w0, w3) = (w(0), w(3));
+        if w3 >> 28 < 8 || w0 == 0 {
+            continue;
+        }
+        if let Some(res) = resolve(w0) {
+            if !out.contains(&res) {
+                out.push(res);
+            }
+        }
+    }
+    out
+}
+
 /// Page budget: the evicted textures `named` (sorted, no repeats) are mapped again and made
 /// pending, to be uploaded whole at the next look. One released meanwhile is left alone; one
 /// that cannot be mapped now stays evicted, for its next use to try again.
@@ -1451,6 +1525,47 @@ unsafe fn subresources_of(src: &Source, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bound table names the textures of its image T#s (word 0 = shared-heap index): not its
+    /// buffer V#s, empty slots, indices no texture has, slots past those looked at, or a texture twice.
+    #[test]
+    fn a_tables_image_descriptors_name_their_textures() {
+        let mut table = vec![0u32; 8 * 20];
+        let mut put = |k: usize, w: [u32; 4]| table[8 * k..8 * k + 4].copy_from_slice(&w);
+        // as a Scaleform draw's table: a buffer V#, an image T#, a buffer V#, an empty slot
+        put(0, [0x4dbc_9a00, 4, 0x80, 0x3101_6fac]);
+        put(1, [0x563e, 0xc380_0000, 0x021b_c3bf, 0x9000_0fac]);
+        put(2, [0x4dbc_9820, 0x0010_0004, 0x1e, 0x0002_403c]);
+        put(4, [0x5640, 0, 0, 0x8000_0000]);
+        put(5, [0x563e, 0, 0, 0x9000_0000]);
+        put(6, [0x7777, 0, 0, 0x9000_0000]);
+        put(7, [0, 0, 0, 0x9000_0000]);
+        put(17, [0x5642, 0, 0, 0x9000_0000]);
+        let resolve = |i: u32| match i {
+            0x563e => Some(0xA000usize),
+            0x5640 => Some(0xB000),
+            0x5642 => Some(0xC000),
+            0x4dbc_9a00 | 0x4dbc_9820 => Some(0xDEAD),
+            _ => None,
+        };
+        let at = table.as_ptr() as usize;
+        assert_eq!(table_textures(at, 16, resolve), vec![0xA000, 0xB000]);
+        assert_eq!(table_textures(at, 18, resolve), vec![0xA000, 0xB000, 0xC000]);
+        assert!(table_textures(0, 16, resolve).is_empty(), "no table");
+    }
+
+    /// A table is looked at once in `TABLE_LOOK_EVERY`; another table, or the same one later,
+    /// is looked at; address 0 never.
+    #[test]
+    fn a_table_is_looked_at_once_per_interval() {
+        let mut last = std::collections::HashMap::new();
+        let t0 = std::time::Instant::now();
+        assert!(table_look_due(&mut last, 0x4dbc_9a80, t0));
+        assert!(!table_look_due(&mut last, 0x4dbc_9a80, t0 + TABLE_LOOK_EVERY / 2));
+        assert!(table_look_due(&mut last, 0x4dbe_9a80, t0 + TABLE_LOOK_EVERY / 2));
+        assert!(table_look_due(&mut last, 0x4dbc_9a80, t0 + TABLE_LOOK_EVERY));
+        assert!(!table_look_due(&mut last, 0, t0));
+    }
 
     /// A texture is left out only when its memory hashes as at its own last upload, and a
     /// texture that was forgotten (released, or its address registered again) is uploaded again.

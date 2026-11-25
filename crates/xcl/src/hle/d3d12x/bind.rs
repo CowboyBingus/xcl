@@ -2273,6 +2273,22 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     Ok(())
 }
 
+/// The CPU addresses of the descriptor tables root arguments `args` of `layout` bind (32-bit
+/// console addresses, in unified memory at `base`); tables at 0 are none.
+fn table_addresses(layout: &Layout, args: &[u8], base: usize) -> Vec<usize> {
+    let word = |at: usize| args.get(at..at + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    layout
+        .params
+        .iter()
+        .filter_map(|p| match *p {
+            Param::Table { at } => Some(word(at as usize)),
+            _ => None,
+        })
+        .filter(|&t| t != 0)
+        .map(|t| base + t as usize)
+        .collect()
+}
+
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
@@ -2331,6 +2347,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     if gfx && io.len() > user {
         draw_textures(&io, user);
     }
+    // page budget: the textures in the bound descriptor tables are sampled
+    if let Some(l) = layout.as_ref().filter(|_| super::vram::tracking()) {
+        super::title_textures::tables_drawn(&table_addresses(l, &args, u.base()));
+    }
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
@@ -2382,6 +2402,27 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// The descriptor tables a draw binds are where its table arguments point (in unified
+    /// memory), constants and root buffers are not tables, and an unset table is none.
+    #[test]
+    fn table_addresses_follow_the_table_arguments() {
+        let layout = Layout {
+            params: vec![Param::Table { at: 0 }, Param::Constants { at: 4, count: 2 }, Param::Descriptor { at: 12 }, Param::Table { at: 20 }, Param::Table { at: 24 }],
+            size: 28,
+            inline: 0,
+            inline_gfx: 0,
+            inline_ms: 0,
+        };
+        let mut args = vec![0u8; 28];
+        args[0..4].copy_from_slice(&0x4dbc_9a80u32.to_le_bytes());
+        args[4..12].copy_from_slice(&[7; 8]);
+        args[12..20].copy_from_slice(&0x1234_5678_9abcu64.to_le_bytes());
+        args[24..28].copy_from_slice(&0x0004_0000u32.to_le_bytes());
+        let base = 0x7_0000_0000usize;
+        assert_eq!(table_addresses(&layout, &args, base), vec![base + 0x4dbc_9a80, base + 0x4_0000]);
+        assert!(table_addresses(&layout, &args[..2], base).is_empty(), "arguments not set yet");
+    }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]
