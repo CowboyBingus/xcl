@@ -199,6 +199,32 @@ struct UploadSlot {
     fence_val: u64,
 }
 
+/// A copy back on `State::rbq`: its list, its readback buffer, the `rb_fence` value it waits
+/// for, the `rbq` fence value that marks it done, and the copies into the title's memory
+/// (address, offset in `buf`, bytes).
+struct RbJob {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    buf: ID3D12Resource,
+    ptr: *mut u8,
+    cap: usize,
+    rb_v: u64,
+    done_v: u64,
+    copies: Vec<(usize, usize, usize)>,
+}
+
+/// How far `drain_readbacks` goes
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Drain {
+    /// only copies the GPU has finished
+    Finished,
+    /// also those whose title work is done (waiting for the copy itself): before a CPU read
+    /// the title made sure of, e.g. after its wait for the value a list wrote (outside tests the
+    /// wait is made with `STATE` released instead: `settle_released`)
+    #[cfg_attr(not(test), allow(dead_code))]
+    TitleDone,
+}
+
 struct State {
     dev: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -206,9 +232,19 @@ struct State {
     value: u64,
     /// reusable auto-reset Win32 event for fence waits (no per-wait CreateEventW/CloseHandle)
     event: HANDLE,
-    /// fence signalled on title queues so `queue` waits before copying GPU writes back to CPU
+    /// fence signalled on title queues after their lists, so a copy back waits for them
     rb_fence: ID3D12Fence,
     rb_value: u64,
+    /// copies back after the title's submissions (`readback_after_execute`): on a queue of their
+    /// own (`rbq`, None: on `queue`, waited for on the CPU), landing in the title's memory once
+    /// done (`drain_readbacks`). The title's queues can wait for work the title submits after
+    /// this one, from the same thread: waiting here for its lists stopped that submission – and,
+    /// on `queue`, every upload behind it (`before_execute` waiting for ring room).
+    rbq: Option<(ID3D12CommandQueue, ID3D12Fence)>,
+    rbq_value: u64,
+    /// submitted copies back, oldest first, and finished ones to reuse
+    rb_jobs: VecDeque<RbJob>,
+    rb_pool: Vec<RbJob>,
     /// (window start, reserved buffer) of each sparse window
     windows: Vec<(usize, ID3D12Resource)>,
     /// video-memory pool heaps (None: given back, its index free for the next one)
@@ -600,6 +636,12 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
     let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
     let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
+    let rbq = (|| -> windows::core::Result<(ID3D12CommandQueue, ID3D12Fence)> {
+        let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
+        let _ = q.SetName(windows::core::w!("xcl sparse readback queue"));
+        Ok((q, dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?))
+    })()
+    .ok();
     let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
     for _ in 0..UPLOAD_SLOTS {
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
@@ -623,6 +665,10 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         event,
         rb_fence,
         rb_value: 0,
+        rbq,
+        rbq_value: 0,
+        rb_jobs: VecDeque::new(),
+        rb_pool: Vec::new(),
         windows,
         pools: Vec::new(),
         free: Vec::new(),
@@ -1252,6 +1298,113 @@ impl State {
         (cur, parts)
     }
 
+    /// A copy back's list and a readback buffer of at least `need` bytes (reused when one fits)
+    unsafe fn rb_job(&mut self, need: usize) -> Option<RbJob> {
+        if let Some(i) = self.rb_pool.iter().enumerate().filter(|(_, j)| j.cap >= need).min_by_key(|(_, j)| j.cap).map(|(i, _)| i) {
+            return Some(self.rb_pool.swap_remove(i));
+        }
+        let cap = need.max(64 << 10).next_power_of_two().min(READBACK_STAGING);
+        let alloc: ID3D12CommandAllocator = self.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+        let list: ID3D12GraphicsCommandList = self.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
+        list.Close().ok()?;
+        let _ = list.SetName(windows::core::w!("xcl sparse readback list"));
+        let mut d = buffer_desc(cap as u64);
+        d.Flags = D3D12_RESOURCE_FLAG_NONE;
+        let mut r: Option<ID3D12Resource> = None;
+        self.dev
+            .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r)
+            .ok()?;
+        let buf = r?;
+        let mut p: *mut c_void = std::ptr::null_mut();
+        buf.Map(0, None, Some(&mut p)).ok()?;
+        Some(RbJob { alloc, list, buf, ptr: p as *mut u8, cap, rb_v: 0, done_v: 0, copies: Vec::new() })
+    }
+
+    /// Land submitted copies back in the title's memory, oldest first, as far as `how` says.
+    unsafe fn drain_readbacks(&mut self, how: Drain) {
+        let Some((_, done)) = self.rbq.clone() else { return };
+        while let Some((rb_v, done_v)) = self.rb_jobs.front().map(|j| (j.rb_v, j.done_v)) {
+            if done.GetCompletedValue() < done_v {
+                if how == Drain::Finished || self.rb_fence.GetCompletedValue() < rb_v {
+                    break;
+                }
+                // the title's lists are done: only the copy itself is left
+                let _ = done.SetEventOnCompletion(done_v, self.event);
+                windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
+                if done.GetCompletedValue() < done_v {
+                    crate::xlog_warn!("sparse: a copy back has not finished 5 s after the title's work it follows");
+                    break;
+                }
+            }
+            let mut job = self.rb_jobs.pop_front().expect("front");
+            let copies = std::mem::take(&mut job.copies);
+            self.copy_back(job.ptr, &copies);
+            RB_PENDING.fetch_sub(1, Ordering::Release);
+            job.copies = copies;
+            job.copies.clear();
+            self.rb_pool.push(job);
+        }
+    }
+
+    /// `readback_released` without a CPU wait: the copies run on `rbq`, after the title's queue
+    /// signalled `rb_fence` = `rb_v`, and land in the title's memory in `drain_readbacks`.
+    unsafe fn readback_async(&mut self, ranges: &[(usize, usize)], rb_v: u64) {
+        let Some((q, done)) = self.rbq.clone() else { return };
+        // the mapped parts, in readback-buffer sized batches: (window, address, bytes)
+        let mut batches: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new()];
+        let mut used = 0usize;
+        for &(a, n) in ranges {
+            let mut at = 0usize;
+            while at < n {
+                let cur = a + at;
+                let tile = cur & !(TILE - 1);
+                let Some(wi) = self.window_index(cur) else { break };
+                let to_tile_end = (tile + TILE) - cur;
+                if !self.mapped.contains_key(&tile) {
+                    at += (n - at).min(to_tile_end);
+                    continue;
+                }
+                if used == READBACK_STAGING {
+                    batches.push(Vec::new());
+                    used = 0;
+                }
+                let to_win_end = (self.windows[wi].0 + crate::gpu::uma::WINDOW) - cur;
+                let chunk = (n - at).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
+                batches.last_mut().expect("batch").push((wi, cur, chunk));
+                used += chunk;
+                at += chunk;
+            }
+        }
+        for batch in batches.into_iter().filter(|b| !b.is_empty()) {
+            let need = batch.iter().map(|c| c.2).sum::<usize>();
+            let Some(mut job) = self.rb_job(need) else {
+                crate::xlog_warn!("sparse: no readback buffer for a copy back of {need} bytes – left out");
+                return;
+            };
+            let _ = job.alloc.Reset();
+            let _ = job.list.Reset(&job.alloc, None);
+            let mut off = 0usize;
+            for (wi, cur, chunk) in batch {
+                let (base, res) = (self.windows[wi].0, self.windows[wi].1.clone());
+                job.list.CopyBufferRegion(&job.buf, off as u64, &res, (cur - base) as u64, chunk as u64);
+                job.copies.push((cur, off, chunk));
+                off += chunk;
+            }
+            if job.list.Close().is_ok() {
+                if let Ok(l) = job.list.cast::<ID3D12CommandList>() {
+                    super::title_textures::own_work(|| q.ExecuteCommandLists(&[Some(l)]));
+                }
+            }
+            self.rbq_value += 1;
+            let _ = q.Signal(&done, self.rbq_value);
+            job.rb_v = rb_v;
+            job.done_v = self.rbq_value;
+            self.rb_jobs.push_back(job);
+            RB_PENDING.fetch_add(1, Ordering::Release);
+            RB_ASYNC.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Asynchronously zero `runs` (address, bytes) in sparse VRAM using the pre-zeroed `zero_buf`
     /// (zero staging ring bytes consumed, zero CPU stall).
     unsafe fn upload_zeros(&mut self, runs: &[(usize, usize)]) {
@@ -1402,30 +1555,138 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     if ranges.is_empty() {
         return;
     }
-    let _one = READBACK.lock().unwrap();
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
-    let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
-    if filtered.is_empty() {
+    let merged = s.after_execute(queue, ranges);
+    if merged.is_empty() {
         return;
     }
-    filtered.sort_unstable();
-    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(filtered.len());
-    for (a, n) in filtered {
-        match merged.last_mut() {
-            Some(last) if a <= last.0.saturating_add(last.1) => {
-                let end = (last.0 + last.1).max(a + n);
-                last.1 = end - last.0;
-            }
-            _ => merged.push((a, n)),
+    // no readback queue: the copy back runs on the state's queue, ordered after the title's,
+    // and is waited for with `STATE` released (`READBACK` is taken before `STATE`)
+    drop(g);
+    let _one = READBACK.lock().unwrap();
+    readback_released(STATE.lock().unwrap(), &merged);
+}
+
+/// copies back submitted and not landed yet, and whether any ran on the readback queue
+static RB_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RB_ASYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether copies back land asynchronously (any ran on the readback queue so far)
+pub fn readbacks_async() -> bool {
+    RB_ASYNC.load(Ordering::Relaxed)
+}
+
+/// Copies back that are done on the GPU, into the title's memory, and those whose title work
+/// is done (waiting for the copy): before a CPU read of memory the title's lists wrote.
+pub unsafe fn settle_readbacks() {
+    if RB_PENDING.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    settle_released(STATE.lock().unwrap(), true);
+}
+
+/// `drain_readbacks(Drain::TitleDone)` of the state, the wait for a copy whose title work is
+/// done made with `STATE` released (`wait_fence`, as in `wait_released`): the readback queue
+/// stands still for as long as the GPU does, and the title's other threads need the lock
+/// meanwhile. The lock is taken again after the wait, tried for ~2 ms unless `patient` (None:
+/// not got).
+unsafe fn settle_released(mut g: MutexGuard<'static, Option<State>>, patient: bool) -> Option<MutexGuard<'static, Option<State>>> {
+    loop {
+        let Some(s) = g.as_mut() else { return Some(g) };
+        s.drain_readbacks(Drain::Finished);
+        let Some((_, done)) = s.rbq.clone() else { return Some(g) };
+        let Some((rb_v, done_v)) = s.rb_jobs.front().map(|j| (j.rb_v, j.done_v)) else { return Some(g) };
+        if s.rb_fence.GetCompletedValue() < rb_v {
+            return Some(g);
+        }
+        drop(g);
+        // the title's lists are done: only the copy itself is left
+        let reached = wait_fence(&done, done_v);
+        g = if patient { STATE.lock().unwrap() } else { try_state()? };
+        if !reached {
+            return Some(g);
         }
     }
-    s.rb_value += 1;
-    let v = s.rb_value;
-    if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.queue.Wait(&s.rb_fence, v);
+}
+
+/// `STATE`, tried for ~2 ms (None: not got)
+fn try_state() -> Option<MutexGuard<'static, Option<State>>> {
+    let t0 = std::time::Instant::now();
+    loop {
+        if let Ok(g) = STATE.try_lock() {
+            return Some(g);
+        }
+        if t0.elapsed() >= std::time::Duration::from_millis(2) {
+            return None;
+        }
+        std::thread::yield_now();
     }
-    readback_released(g, &merged);
+}
+
+/// `settle_readbacks` from a fence observation: the state's lock is only tried (for ~2 ms), as
+/// XCL may be waiting on a fence of its own with the lock held.
+pub unsafe fn settle_readbacks_try() {
+    if RB_PENDING.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    if let Some(g) = try_state() {
+        settle_released(g, false);
+    }
+}
+
+/// The thread that moves finished copies back into the title's memory, so it sees what its
+/// lists wrote without submitting again (started with the first copy back).
+fn start_readback_thread() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-sparse-readback".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_micros(500));
+            if let Ok(mut g) = STATE.try_lock() {
+                if let Some(s) = g.as_mut().filter(|s| !s.rb_jobs.is_empty()) {
+                    unsafe { s.drain_readbacks(Drain::Finished) };
+                }
+            }
+        });
+    });
+}
+
+impl State {
+    /// `readback_after_execute` on this state. Returns the ranges still to copy back on `queue`
+    /// (already ordered after the title's), when there is no readback queue (`readback_released`).
+    unsafe fn after_execute(&mut self, queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let s = self;
+        let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
+        if filtered.is_empty() {
+            return Vec::new();
+        }
+        filtered.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(filtered.len());
+        for (a, n) in filtered {
+            match merged.last_mut() {
+                Some(last) if a <= last.0.saturating_add(last.1) => {
+                    let end = (last.0 + last.1).max(a + n);
+                    last.1 = end - last.0;
+                }
+                _ => merged.push((a, n)),
+            }
+        }
+        s.rb_value += 1;
+        let v = s.rb_value;
+        let signalled = queue.Signal(&s.rb_fence, v).is_ok();
+        if let Some((q, _)) = s.rbq.clone() {
+            if signalled {
+                let _ = q.Wait(&s.rb_fence, v);
+            }
+            s.readback_async(&merged, v);
+            start_readback_thread();
+            return Vec::new();
+        }
+        if signalled {
+            let _ = s.queue.Wait(&s.rb_fence, v);
+        }
+        merged
+    }
 }
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
@@ -1439,6 +1700,12 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     }
     let _one = READBACK.lock().unwrap();
     let mut g = STATE.lock().unwrap();
+    if g.as_ref().is_none_or(|s| s.window_index(va).is_none()) {
+        return;
+    }
+    // copies back of earlier submissions first: their data is older than this one's
+    let Some(again) = settle_released(g, true) else { return };
+    g = again;
     let Some(mut s) = g.as_mut() else { return };
     if s.window_index(va).is_none() {
         return;
@@ -1639,6 +1906,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let t0 = std::time::Instant::now();
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
+    s.drain_readbacks(Drain::Finished);
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
         s.retire_free_pools();
@@ -1795,6 +2063,126 @@ pub fn forget_buffer(res: usize) {
 mod tests {
     use super::*;
 
+    /// A copy back after a title submission does not wait for the title's queue: that queue can
+    /// be waiting for work the title submits next, from the thread that is in here. The copy
+    /// lands once the title's work is done (`drain_readbacks`). Before, the sparse queue
+    /// GPU-waited for the title's queue and this thread waited for the copy (5 s, then on).
+    #[test]
+    fn a_copy_back_does_not_wait_for_the_title_queue() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let base = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert!(base != 0 && base % TILE == 0);
+            assert!(!VirtualAlloc(base as *const c_void, TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            let mut reserved: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&buffer_desc(TILE as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).expect("CreateReservedResource");
+            let reserved = reserved.expect("reserved buffer");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+            rb_list.Close().expect("rb_list close");
+            let rbq_queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("readback queue");
+            let rbq_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("readback fence");
+
+            let mut s = State {
+                dev: dev.clone(),
+                queue,
+                fence,
+                value: 0,
+                event,
+                rb_fence,
+                rb_value: 0,
+                rbq: Some((rbq_queue, rbq_fence)),
+                rbq_value: 0,
+                rb_jobs: VecDeque::new(),
+                rb_pool: Vec::new(),
+                windows: vec![(base, reserved.clone())],
+                pools: Vec::new(),
+                free: Vec::new(),
+                retired: Vec::new(),
+                mapped: FxHashMap::default(),
+                pinned: FxHashMap::default(),
+                parked: FxHashMap::default(),
+                buffers: FxHashMap::default(),
+                to_zero: Vec::new(),
+                staging: None,
+                ring_write: 0,
+                ring_submitted: 0,
+                ring_free: 0,
+                inflight: VecDeque::new(),
+                zero_buf: None,
+                slots: Vec::new(),
+                next_slot: 0,
+                readback: None,
+                rb_alloc,
+                rb_list,
+                rb_last_fence: 0,
+                waited: FxHashMap::default(),
+                runs: None,
+                scratch_runs: Vec::new(),
+            };
+            s.commit_range(base, TILE);
+            assert!(s.mapped.contains_key(&base));
+            std::ptr::write_bytes(base as *mut u8, 0, 256);
+
+            // the title's queue: blocked on a fence nothing has signalled yet, then a copy of
+            // 0..64 into the tile (a GPU write the title's next CPU read expects)
+            let title: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate");
+            let mut up: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &{ let mut d = buffer_desc(256); d.Flags = D3D12_RESOURCE_FLAG_NONE; d }, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up)
+                .expect("upload buffer");
+            let up = up.expect("upload buffer");
+            let mut p: *mut c_void = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut p)).expect("Map");
+            for i in 0..64u32 {
+                *(p as *mut u32).add(i as usize) = 0xC0DE_0000 | i;
+            }
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+            list.CopyBufferRegion(&reserved, 0, &up, 0, 256);
+            list.Close().expect("close");
+            title.Wait(&s.fence, s.value).expect("wait for the tile mapping");
+            title.Wait(&gate, 1).expect("wait for the gate");
+            title.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+
+            let t0 = std::time::Instant::now();
+            s.after_execute(&title, &[(base, 256)]);
+            let took = t0.elapsed();
+            assert!(took < std::time::Duration::from_secs(1), "the copy back waited {took:?} for the title's queue");
+            s.drain_readbacks(Drain::Finished);
+            assert_eq!(*(base as *const u32), 0, "nothing lands before the title's work is done");
+
+            // the title's queue goes on: the copy back lands once it is done
+            gate.Signal(1).expect("gate signal");
+            // as the title would: wait for its own work (here the fence its queue signalled)
+            if s.rb_fence.GetCompletedValue() < s.rb_value {
+                s.rb_fence.SetEventOnCompletion(s.rb_value, s.event).expect("SetEventOnCompletion");
+                windows::Win32::System::Threading::WaitForSingleObject(s.event, 5000);
+            }
+            s.drain_readbacks(Drain::TitleDone);
+            for i in 0..64u32 {
+                assert_eq!(*(base as *const u32).add(i as usize), 0xC0DE_0000 | i, "dword {i} after the copy back");
+            }
+            assert!(s.rb_jobs.is_empty(), "the copy back was consumed");
+            assert_eq!(s.rb_pool.len(), 1, "its buffer is kept for the next one");
+            drop(s);
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
     /// `queue()` answers while the state's lock is held: a resource's last `Release` asks for
     /// it (`late_release::drain_known`) from inside a D3D12 call that the lock's holder can be
     /// waiting for (a list's `Reset` against an upload's allocator `Reset`, with `XCL_DRED=1`).
@@ -1868,6 +2256,10 @@ mod tests {
                 event,
                 rb_fence,
                 rb_value: 0,
+                rbq: None,
+                rbq_value: 0,
+                rb_jobs: VecDeque::new(),
+                rb_pool: Vec::new(),
                 windows: Vec::new(),
                 pools: Vec::new(),
                 free: Vec::new(),
@@ -2074,6 +2466,10 @@ mod tests {
                 event,
                 rb_fence,
                 rb_value: 0,
+                rbq: None,
+                rbq_value: 0,
+                rb_jobs: VecDeque::new(),
+                rb_pool: Vec::new(),
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
@@ -2172,6 +2568,10 @@ mod tests {
                 event,
                 rb_fence,
                 rb_value: 0,
+                rbq: None,
+                rbq_value: 0,
+                rb_jobs: VecDeque::new(),
+                rb_pool: Vec::new(),
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
