@@ -30,7 +30,25 @@ struct Pending {
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
     late: std::sync::atomic::AtomicBool,
     demand: Mutex<Demand>,
+    /// lab (`code`): builds the real pipeline again after it was given back to the driver
+    again: Option<Again>,
+    /// lab: bytes of the driver's compiled code of the real pipeline (0: not measured)
+    code: AtomicUsize,
+    /// lab: of that, its two-pass compute pass
+    code_pass: AtomicUsize,
+    /// lab: `code::now_ms` and the present of its last use with the real pipeline (0: never)
+    last_use: std::sync::atomic::AtomicU64,
+    last_frame: std::sync::atomic::AtomicU64,
+    /// lab: its code counts as in use (used since it was built)
+    in_use: std::sync::atomic::AtomicBool,
+    /// lab: its real pipeline was given back and is not built again yet
+    given: std::sync::atomic::AtomicBool,
+    /// lab: `code::now_ms` when its real pipeline was built
+    built_ms: std::sync::atomic::AtomicU64,
 }
+
+/// Builds a real pipeline as often as asked (`submit_lazy_again`).
+pub type Again = Arc<dyn Fn() -> usize + Send + Sync>;
 
 /// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
 #[derive(Default)]
@@ -119,6 +137,7 @@ fn complete(p: &Pending, real: usize) {
         FAILED.fetch_add(1, Ordering::Relaxed);
     } else {
         BUILT.fetch_add(1, Ordering::Relaxed);
+        code::built(p, real);
     }
     let orphan = {
         let mut done = p.done.lock().unwrap();
@@ -201,7 +220,7 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0);
+    submit_as(standin, compute, job, true, 0, None);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -217,10 +236,17 @@ pub fn lazy() -> bool {
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`) – or now, at a low
 /// priority, when an earlier run used a pipeline of these shaders (`key`, 0 = none; `used`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
-    submit_as(standin, compute, job, false, key);
+    submit_as(standin, compute, job, false, key, None);
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+/// `submit_lazy` with a build that can run again: the real pipeline may be given back to the
+/// driver while nothing uses it and is built again at its next bind (`code`).
+pub fn submit_lazy_again(standin: usize, compute: bool, again: Again, key: u64) {
+    let first = again.clone();
+    submit_as(standin, compute, Box::new(move || first()), false, key, Some(again));
+}
+
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, again: Option<Again>) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
@@ -233,6 +259,14 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         orphan: Default::default(),
         late: Default::default(),
         demand: Default::default(),
+        again,
+        code: Default::default(),
+        code_pass: Default::default(),
+        last_use: Default::default(),
+        last_frame: Default::default(),
+        in_use: Default::default(),
+        given: Default::default(),
+        built_ms: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -509,6 +543,383 @@ mod used_tests {
     }
 }
 
+/// Lab: the compiled shader code the driver holds for the pipelines in use, and giving back
+/// the ones nothing has used for a while.
+///
+/// NVIDIA's driver keeps the machine code of every pipeline from its first use until its
+/// release in one heap of at most 512 MB, and removes the device (0x887a0005, nothing in DRED)
+/// at the submit that needs more (xcl-dev/xcl issue 2403). A retail title's world uses ~1100
+/// translated compute pipelines of ~435 MB of code (`GetCachedBlob`) on a 32-lane GPU.
+///
+/// `XCL_PSO_CODE=1`: a `shader code lab:` line every 2 s (`tick`). `XCL_PSO_CODE_MB=<n>`: also,
+/// while the code in use is over n MB, the real pipelines of stand-ins (compute ones;
+/// `XCL_PSO_CODE_GFX=1`: graphics ones too) not used for `XCL_PSO_IDLE_S` seconds (8) and 3
+/// presents are released, longest unused first – a few seconds and 2 presents after they were
+/// taken from their stand-in (lists recorded with them have run by then). The next bind builds
+/// one again, from the driver's blob of the first build (milliseconds).
+/// `XCL_PSO_CODE_CAP_MB=<n>`: a pipeline not in use whose code would bring the code in use (and
+/// waiting for its release) over n MB is not used: its binds get the stand-in, as those of a
+/// pipeline still being built (dispatches and draws skipped), until there is room.
+/// `XCL_PSO_UNUSED_S=<n>`: a real pipeline nothing has used n seconds after it was built (built
+/// ahead of its use because an earlier run used it) is given back whatever the budget: built
+/// pipelines cost memory in the driver (~0.6 GB for a retail title's 4500).
+mod code {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    fn var(name: &str) -> Option<u64> {
+        std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
+    }
+
+    /// bytes of code in use to stay under (None: nothing is given back)
+    fn budget() -> Option<usize> {
+        static B: OnceLock<Option<usize>> = OnceLock::new();
+        *B.get_or_init(|| var("XCL_PSO_CODE_MB").map(|mb| (mb as usize) << 20))
+    }
+
+    pub fn enabled() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| budget().is_some() || var("XCL_PSO_CODE") == Some(1))
+    }
+
+    fn idle_ms() -> u64 {
+        static I: OnceLock<u64> = OnceLock::new();
+        *I.get_or_init(|| var("XCL_PSO_IDLE_S").unwrap_or(5) * 1000)
+    }
+
+    fn unused_ms() -> Option<u64> {
+        static U: OnceLock<Option<u64>> = OnceLock::new();
+        *U.get_or_init(|| var("XCL_PSO_UNUSED_S").map(|s| s * 1000))
+    }
+
+    fn cap() -> Option<usize> {
+        static C: OnceLock<Option<usize>> = OnceLock::new();
+        *C.get_or_init(|| var("XCL_PSO_CODE_CAP_MB").map(|mb| (mb as usize) << 20))
+    }
+
+    fn graphics_too() -> bool {
+        static G: OnceLock<bool> = OnceLock::new();
+        *G.get_or_init(|| var("XCL_PSO_CODE_GFX") == Some(1))
+    }
+
+    /// presents since its last use before a pipeline is taken from its stand-in
+    const IDLE_FRAMES: u64 = 2;
+    /// … and time and presents from then to its release
+    const GRAVE_MS: u64 = 2000;
+    const GRAVE_FRAMES: u64 = 2;
+
+    /// milliseconds since the first call, never 0
+    fn now_ms() -> u64 {
+        static T0: OnceLock<std::time::Instant> = OnceLock::new();
+        T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+    }
+
+    fn frame() -> u64 {
+        super::super::present::presents()
+    }
+
+    static GIVEN_BACK: AtomicUsize = AtomicUsize::new(0);
+    static REBUILT: AtomicUsize = AtomicUsize::new(0);
+    static REBUILD_US: AtomicU64 = AtomicU64::new(0);
+    static EVER_USED: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+    /// bytes of code in use, and of pipelines waiting for their release (`GRAVE`)
+    static IN_USE: AtomicUsize = AtomicUsize::new(0);
+    static GRAVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    /// binds that got the stand-in because of `cap`
+    static HELD_BACK: AtomicUsize = AtomicUsize::new(0);
+    /// pipelines released here that something else still held a reference to
+    static STILL_HELD: AtomicUsize = AtomicUsize::new(0);
+
+    /// real pipelines taken from their stand-ins, to release: (pipeline, when, present, code)
+    static GRAVE: Mutex<Vec<(usize, u64, u64, usize)>> = Mutex::new(Vec::new());
+
+    /// `real` was built for `p`: its code is measured once.
+    pub fn built(p: &Pending, real: usize) {
+        p.given.store(false, Ordering::Release);
+        p.built_ms.store(now_ms(), Ordering::Relaxed);
+        if !enabled() || cfg!(test) || p.code.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        let (own, pass) = super::super::real::pso_code(real);
+        p.code_pass.store(pass, Ordering::Relaxed);
+        p.code.store((own + pass).max(1), Ordering::Relaxed);
+    }
+
+    /// A bind (or a lookup for one) got `real` for the stand-in `standin` of `p`: what it
+    /// uses (`standin` when `cap` has no room for the code of `real`).
+    pub fn used(p: &Pending, standin: usize, real: usize) -> usize {
+        if !enabled() {
+            return real;
+        }
+        let code = p.code.load(Ordering::Relaxed);
+        if !p.in_use.load(Ordering::Relaxed) {
+            if cap().is_some_and(|cap| IN_USE.load(Ordering::Relaxed) + GRAVE_BYTES.load(Ordering::Relaxed) + code > cap) {
+                let n = HELD_BACK.fetch_add(1, Ordering::Relaxed);
+                if n < 4 || (n + 1).is_power_of_two() {
+                    crate::xlog_warn!("shader code lab: no room for the {} KB of a pipeline's code under the cap: its binds get the stand-in ({} so far)", code >> 10, n + 1);
+                }
+                return standin;
+            }
+        }
+        p.last_frame.store(frame(), Ordering::Relaxed);
+        p.last_use.store(now_ms(), Ordering::Relaxed);
+        if !p.in_use.swap(true, Ordering::Relaxed) {
+            IN_USE.fetch_add(code, Ordering::Relaxed);
+            EVER_USED[if p.compute { 0 } else { 1 }].fetch_add(code, Ordering::Relaxed);
+        }
+        real
+    }
+
+    /// `p` is no longer in use.
+    fn unused(p: &Pending) {
+        if p.in_use.swap(false, Ordering::Relaxed) {
+            let code = p.code.load(Ordering::Relaxed);
+            let _ = IN_USE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(code)));
+        }
+    }
+
+    /// The title released the stand-in of `p`.
+    pub fn gone(p: &Pending) {
+        unused(p);
+    }
+
+    /// Lab: the code in use right now, for the log line of a device removal.
+    pub fn now() -> Option<String> {
+        enabled().then(|| {
+            let st = scan(None, 0, false, now_ms(), frame()).0;
+            format!(
+                "in use {} pipelines / {} KB (compute {} / {} KB, graphics {} / {} KB), waiting for release {} KB, held back by the cap {}",
+                st.in_use[0].0 + st.in_use[1].0,
+                (st.in_use[0].1 + st.in_use[1].1) >> 10,
+                st.in_use[0].0,
+                st.in_use[0].1 >> 10,
+                st.in_use[1].0,
+                st.in_use[1].1 >> 10,
+                GRAVE_BYTES.load(Ordering::Relaxed) >> 10,
+                HELD_BACK.load(Ordering::Relaxed)
+            )
+        })
+    }
+
+    /// Take the real pipeline from `p` (to release later): `p` is as before its first build.
+    fn give_back(p: &Arc<Pending>) -> Option<usize> {
+        let again = p.again.clone()?;
+        let mut done = p.done.lock().unwrap();
+        if !*done {
+            return None;
+        }
+        let real = p.real.swap(0, Ordering::AcqRel);
+        if real == 0 {
+            return None;
+        }
+        *p.job.lock().unwrap() = Some(Box::new(move || {
+            let t = std::time::Instant::now();
+            let r = again();
+            REBUILT.fetch_add(1, Ordering::Relaxed);
+            REBUILD_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            r
+        }));
+        p.sent.store(false, Ordering::Release);
+        p.late.store(false, Ordering::Release);
+        p.given.store(true, Ordering::Release);
+        unused(p);
+        *done = false;
+        GIVEN_BACK.fetch_add(1, Ordering::Relaxed);
+        Some(real)
+    }
+
+    #[derive(Default)]
+    struct Stats {
+        /// (pipelines, bytes) of compute and graphics: built now, in use now, used in the last 10 s
+        built: [(usize, usize); 2],
+        in_use: [(usize, usize); 2],
+        recent: [(usize, usize); 2],
+        /// in use, of 1 MB or more
+        big: (usize, usize),
+        /// in use: code of two-pass compute passes
+        pass: usize,
+    }
+
+    /// The pipelines to give back so that the code in use is at most `budget`, longest unused
+    /// first, and what there is now. `now` / `frame`: `now_ms` / presents.
+    fn scan(budget: Option<usize>, idle_ms: u64, graphics: bool, now: u64, frame: u64) -> (Stats, Vec<Arc<Pending>>) {
+        let mut st = Stats::default();
+        let mut idle: Vec<(u64, Arc<Pending>)> = Vec::new();
+        let mut never: Vec<Arc<Pending>> = Vec::new();
+        let unused = if budget.is_some() { unused_ms() } else { None };
+        {
+            let g = PENDING.lock().unwrap();
+            for p in g.iter().flat_map(|m| m.values()) {
+                if p.real.load(Ordering::Acquire) == 0 {
+                    continue;
+                }
+                let add = |e: &mut (usize, usize), n: usize| *e = (e.0 + 1, e.1 + n);
+                let (k, code) = (if p.compute { 0 } else { 1 }, p.code.load(Ordering::Relaxed));
+                add(&mut st.built[k], code);
+                if !p.in_use.load(Ordering::Relaxed) {
+                    if unused.is_some_and(|ms| now.saturating_sub(p.built_ms.load(Ordering::Relaxed)) >= ms) && p.again.is_some() {
+                        never.push(p.clone());
+                    }
+                    continue;
+                }
+                add(&mut st.in_use[k], code);
+                st.pass += p.code_pass.load(Ordering::Relaxed);
+                if code >= 1 << 20 {
+                    add(&mut st.big, code);
+                }
+                let last = p.last_use.load(Ordering::Relaxed);
+                if now.saturating_sub(last) < 10_000 {
+                    add(&mut st.recent[k], code);
+                }
+                let unused = now.saturating_sub(last) >= idle_ms && frame >= p.last_frame.load(Ordering::Relaxed) + IDLE_FRAMES;
+                if unused && p.again.is_some() && (p.compute || graphics) {
+                    idle.push((last, p.clone()));
+                }
+            }
+        }
+        let mut out = never;
+        if let Some(budget) = budget {
+            idle.sort_by_key(|e| e.0);
+            let mut total = st.in_use[0].1 + st.in_use[1].1;
+            for (_, p) in idle {
+                if total <= budget {
+                    break;
+                }
+                total = total.saturating_sub(p.code.load(Ordering::Relaxed));
+                out.push(p);
+            }
+        }
+        (st, out)
+    }
+
+    /// Every 2 s (the activity thread): give back and release what is due; the lab line.
+    pub fn tick() -> Option<String> {
+        if !enabled() {
+            return None;
+        }
+        let (now, frame) = (now_ms(), frame());
+        let (st, idle) = scan(budget(), idle_ms(), graphics_too(), now, frame);
+        let mut given = (0usize, 0usize);
+        for p in idle {
+            let code = p.code.load(Ordering::Relaxed);
+            if let Some(real) = give_back(&p) {
+                GRAVE_BYTES.fetch_add(code, Ordering::Relaxed);
+                GRAVE.lock().unwrap().push((real, now, frame, code));
+                given = (given.0 + 1, given.1 + code);
+            }
+        }
+        let all = std::mem::take(&mut *GRAVE.lock().unwrap());
+        let (due, waiting): (Vec<_>, Vec<_>) = all.into_iter().partition(|&(_, t, f, _)| now.saturating_sub(t) >= GRAVE_MS && frame >= f + GRAVE_FRAMES);
+        let held: usize = waiting.iter().map(|e| e.3).sum();
+        GRAVE.lock().unwrap().extend(waiting);
+        let released: usize = due.iter().map(|e| e.3).sum();
+        for &(real, _, _, code) in &due {
+            // (its last reference, if nothing else holds one)
+            let left = unsafe {
+                let f: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 = std::mem::transmute(*(*(real as *const *const usize)).add(2));
+                f(real as *mut std::ffi::c_void)
+            };
+            if left != 0 {
+                STILL_HELD.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = GRAVE_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(code)));
+        }
+        let mb = |b: usize| b as f64 / (1 << 20) as f64;
+        Some(format!(
+            "in use {} pipelines / {:.0} MB (compute {} / {:.0}, graphics {} / {:.0}; of 1 MB or more {} / {:.0}; two-pass compute passes {:.0}), used in the last 10 s {:.0} + {:.0} MB; built {} / {:.0} + {} / {:.0} MB; ever used {:.0} + {:.0} MB; given back now {} / {:.0} MB, released now {} / {:.0} MB, waiting for release {:.0} MB; so far given back {}, built again {} in {} ms, held back by the cap {}, released but still referenced {}",
+            st.in_use[0].0 + st.in_use[1].0,
+            mb(st.in_use[0].1 + st.in_use[1].1),
+            st.in_use[0].0,
+            mb(st.in_use[0].1),
+            st.in_use[1].0,
+            mb(st.in_use[1].1),
+            st.big.0,
+            mb(st.big.1),
+            mb(st.pass),
+            mb(st.recent[0].1),
+            mb(st.recent[1].1),
+            st.built[0].0,
+            mb(st.built[0].1),
+            st.built[1].0,
+            mb(st.built[1].1),
+            mb(EVER_USED[0].load(Ordering::Relaxed)),
+            mb(EVER_USED[1].load(Ordering::Relaxed)),
+            given.0,
+            mb(given.1),
+            due.len(),
+            mb(released),
+            mb(held),
+            GIVEN_BACK.load(Ordering::Relaxed),
+            REBUILT.load(Ordering::Relaxed),
+            REBUILD_US.load(Ordering::Relaxed) / 1000,
+            HELD_BACK.load(Ordering::Relaxed),
+            STILL_HELD.load(Ordering::Relaxed)
+        ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A compute pipeline nothing used for a while is taken from its stand-in when the code
+        /// in use is over the budget – the longest unused one first, and no more than needed –
+        /// and its next bind builds it again; one without a build that can run again is kept.
+        #[test]
+        fn an_unused_pipeline_is_given_back_and_built_again_at_its_next_bind() {
+            let (old, new, once) = (0x7E57_C001usize, 0x7E57_C002usize, 0x7E57_C003usize);
+            let builds = Arc::new(AtomicUsize::new(0));
+            let n = builds.clone();
+            submit_lazy_again(old, true, Arc::new(move || 0xA000 + n.fetch_add(1, Ordering::SeqCst)), 0);
+            submit_lazy_again(new, true, Arc::new(|| 0xB000), 0);
+            submit_lazy(once, true, Box::new(|| 0xC000), 0);
+            assert_eq!(resolve_wait_for(old, None), 0xA000);
+            assert_eq!(resolve_wait_for(new, None), 0xB000);
+            assert_eq!(resolve_wait_for(once, None), 0xC000);
+            // (the test build measures nothing and counts no use: set here)
+            for (pso, last) in [(old, 10u64), (new, 20), (once, 5)] {
+                let p = entry(pso).unwrap();
+                p.code.store(300, Ordering::Relaxed);
+                p.in_use.store(true, Ordering::Relaxed);
+                p.last_use.store(last, Ordering::Relaxed);
+                p.last_frame.store(1, Ordering::Relaxed);
+            }
+            let ours = |v: Vec<Arc<Pending>>| -> Vec<usize> { v.iter().map(|p| p.real.load(Ordering::Acquire)).filter(|r| [0xA000, 0xB000, 0xC000].contains(r)).collect() };
+            // used too recently (time, then presents): nothing
+            assert!(ours(scan(Some(0), 1000, false, 900, 100).1).is_empty());
+            assert!(ours(scan(Some(0), 1000, false, 5000, IDLE_FRAMES).1).is_empty());
+            // over the budget by one pipeline (other tests' stand-ins have no code): the oldest
+            let total: usize = {
+                let s = scan(None, 0, false, 5000, 100).0;
+                s.in_use[0].1 + s.in_use[1].1
+            };
+            assert_eq!(ours(scan(Some(total - 1), 1000, false, 5000, 100).1), [0xA000]);
+            assert!(ours(scan(Some(total), 1000, false, 5000, 100).1).is_empty());
+            // all of it: both that can be built again, oldest first; never the other one
+            assert_eq!(ours(scan(Some(0), 1000, false, 5000, 100).1), [0xA000, 0xB000]);
+            let p = entry(old).unwrap();
+            assert_eq!(give_back(&p), Some(0xA000));
+            assert!(is_pending(old) && give_back(&p).is_none(), "as before its first build");
+            assert!(give_back(&entry(once).unwrap()).is_none());
+            assert_eq!(resolve_wait_for(old, None), 0xA001, "built again at the next bind");
+            assert_eq!(builds.load(Ordering::SeqCst), 2);
+            assert!(!is_pending(old));
+            for pso in [old, new, once] {
+                let _ = released(pso);
+            }
+        }
+    }
+}
+
+/// Lab: the `shader code lab:` line of `code` (None: off).
+pub fn code_tick() -> Option<String> {
+    code::tick()
+}
+
+/// Lab: the code in use now (None: off), for the log of a device removal.
+pub fn code_now() -> Option<String> {
+    code::now()
+}
+
 fn entry(pso: usize) -> Option<Arc<Pending>> {
     PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
@@ -525,7 +936,7 @@ pub fn resolve(pso: usize) -> usize {
             }
             pso
         }
-        r => r,
+        r => code::used(&p, pso, r),
     }
 }
 
@@ -544,19 +955,25 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
-    let job = p.job.lock().unwrap().take();
-    if let Some(job) = job {
-        complete(&p, job());
+    // (twice: a pipeline given back to the driver between its build and here is built again)
+    for _ in 0..2 {
+        let job = p.job.lock().unwrap().take();
+        if let Some(job) = job {
+            complete(&p, job());
+        }
+        p.want();
+        let mut done = p.done.lock().unwrap();
+        while !*done {
+            done = p.cv.wait(done).unwrap();
+        }
+        drop(done);
+        match p.real.load(Ordering::Acquire) {
+            0 if p.job.lock().unwrap().is_some() => continue,
+            0 => return pso,
+            r => return code::used(&p, pso, r),
+        }
     }
-    p.want();
-    let mut done = p.done.lock().unwrap();
-    while !*done {
-        done = p.cv.wait(done).unwrap();
-    }
-    match p.real.load(Ordering::Acquire) {
-        0 => pso,
-        r => r,
-    }
+    pso
 }
 
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
@@ -574,7 +991,7 @@ fn wait_budget() -> Option<std::time::Duration> {
 fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
         0 => pso,
-        r => r,
+        r => code::used(p, pso, r),
     };
     if *p.done.lock().unwrap() {
         return built(p);
@@ -604,6 +1021,9 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
         Some(p) if p.compute => resolve_wait(pso),
+        // (lab: given back to the driver – built again here from the driver's blob, not by a
+        // worker frames later)
+        Some(p) if p.given.load(Ordering::Acquire) => resolve_wait_for(pso, None),
         Some(_) => resolve(pso),
         None => pso,
     }
@@ -614,6 +1034,7 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    code::gone(&p);
     let done = p.done.lock().unwrap();
     if *done {
         p.real.swap(0, Ordering::AcqRel)

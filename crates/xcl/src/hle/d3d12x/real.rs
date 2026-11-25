@@ -1841,12 +1841,44 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
 unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
-    if n == 0 {
+    // The last reference: what XCL keeps by the pipeline's address is dropped BEFORE the driver
+    // frees it. After, a pipeline another thread makes meanwhile can get the address, register
+    // itself and lose its entries (a translated compute program then counts as untranslated and
+    // its dispatches are skipped) - likely once pipelines are released and built again all the
+    // time (`pso_async::code`). Two threads releasing the last two references at once can both
+    // miss being the last: then it is forgotten after, as before.
+    let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+    let last = add(this) == 2;
+    f(this);
+    let real = if last {
         forget_pso(this as usize);
-        super::pso_async::release(super::pso_async::released(this as usize));
+        Some(super::pso_async::released(this as usize))
+    } else {
+        None
+    };
+    let n = f(this);
+    match real {
+        Some(real) => super::pso_async::release(real),
+        None if n == 0 => {
+            forget_pso(this as usize);
+            super::pso_async::release(super::pso_async::released(this as usize));
+        }
+        None => {}
     }
     n
+}
+
+/// Lab (`pso_async::code`): bytes of the driver's compiled code of a pipeline (`GetCachedBlob`)
+/// and of its two-pass compute pass.
+pub(super) fn pso_code(pso: usize) -> (usize, usize) {
+    let size = |p: usize| unsafe { read_pso_cached_blob(p as *mut c_void) }.map_or(0, |b| b.len());
+    let pass = TWO_PASS.lock().unwrap().as_ref().and_then(|m| m.get(&pso).map(|t| t.compute));
+    // (a shared pass counts for the pipeline it was made for)
+    let first = |p: usize| unsafe {
+        raw_pso_ref(p, 1);
+        raw_pso_ref(p, 2) == 1
+    };
+    (size(pso), pass.filter(|&p| !shared_passes() || first(p)).map_or(0, size))
 }
 
 /// A pipeline state is gone: drop what XCL keeps by its address (a later pipeline may get the
@@ -4071,6 +4103,32 @@ mod big_compile_tests {
     }
 }
 
+/// Lab (`XCL_PSO_SKIP_FILE=<file>`): console compute programs that get no pipeline, by the hash of
+/// their container (a 16-digit hexadecimal number at the start of a line; the rest of the line is
+/// not read). Their stand-ins stay, so their dispatches are skipped. To keep a family of huge
+/// programs out of the driver's 512 MB of shader code (`pso_async::code`): a retail title's 265
+/// CS_RaytracingResolve programs in use are 210 MB of it.
+fn skipped_compute(record: u64) -> bool {
+    static SKIP: std::sync::OnceLock<HashSet<u64>> = std::sync::OnceLock::new();
+    static N: AtomicU64 = AtomicU64::new(0);
+    let set = SKIP.get_or_init(|| {
+        let text = std::env::var("XCL_PSO_SKIP_FILE").ok().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        let set: HashSet<u64> = text.lines().filter_map(|l| u64::from_str_radix(l.get(..16)?, 16).ok()).collect();
+        if !set.is_empty() {
+            crate::xlog_info!("D3D12.X: lab: {} console compute programs get no pipeline (XCL_PSO_SKIP_FILE)", set.len());
+        }
+        set
+    });
+    let skip = set.contains(&record);
+    if skip {
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: lab: {n} compute pipelines not made (XCL_PSO_SKIP_FILE)");
+        }
+    }
+    skip
+}
+
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     with_switch_fallback(|| translated_compute_pso_once(this, f, desc, riid, ppv))
 }
@@ -4087,6 +4145,10 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     // made when first bound (`pso_async::lazy`): not even translated now
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
+        return Some(Err(()));
+    }
+    // lab: a program that is not to be made (its dispatches are skipped)
+    if skipped_compute(crate::gpu::shader::fnv64(cs)) {
         return Some(Err(()));
     }
     let compiled = match console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) {
@@ -5172,6 +5234,8 @@ enum OwnedDesc {
 }
 
 unsafe impl Send for OwnedDesc {}
+// (read only once made: a build that runs again, `pso_async::submit_lazy_again`)
+unsafe impl Sync for OwnedDesc {}
 
 /// A hash of a pipeline's shaders in their order (never 0): what `pso_async` knows a used
 /// pipeline by in the next run.
@@ -5348,18 +5412,18 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
-    let job: super::pso_async::Job = Box::new(move || {
+    let job = move || {
         let mut out: *mut c_void = std::ptr::null_mut();
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
             out as usize
         } else {
             0
         }
-    });
+    };
     if super::pso_async::lazy() {
-        super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
+        super::pso_async::submit_lazy_again(*ppv as usize, compute, std::sync::Arc::new(job), key);
     } else {
-        super::pso_async::submit(*ppv as usize, compute, job);
+        super::pso_async::submit(*ppv as usize, compute, Box::new(job));
     }
     Some(hr)
 }
@@ -5491,13 +5555,61 @@ pub struct TwoPassPso {
     pub kind: &'static str,
     /// lab: FNV-1a of the console MS container (0: GS)
     pub ms_hash: u64,
+    /// lab (`shared_passes`): what `SHARED_PASSES` knows `compute` by
+    pass_key: (u64, usize, i32),
 }
 
 impl Drop for TwoPassPso {
     fn drop(&mut self) {
-        // the compute pipeline state is XCL's (the root signatures are cached or the title's)
-        super::pso_async::release(self.compute);
+        // the compute pipeline state is XCL's (the root signatures are cached or the title's);
+        // shared: one reference each, and the last one takes it out of `SHARED_PASSES`
+        let mut g = SHARED_PASSES.lock().unwrap();
+        let left = unsafe { raw_pso_ref(self.compute, 2) };
+        if left == 0 {
+            if let Some(m) = g.as_mut() {
+                if m.get(&self.pass_key) == Some(&self.compute) {
+                    m.remove(&self.pass_key);
+                }
+            }
+        }
     }
+}
+
+/// Lab (`XCL_TWO_PASS_SHARE=1`): the compute pass of two-pass pipelines by its program and root
+/// signature (`compute_blob_key`). A title makes many `(MS, PS, state)` pipelines of one console
+/// MS; each had a compute pipeline of its own with the same code, and the driver keeps the code
+/// of every pipeline in use (`pso_async::code`). Not owning: each `TwoPassPso` holds a reference.
+static SHARED_PASSES: Mutex<Option<HashMap<(u64, usize, i32), usize>>> = Mutex::new(None);
+static SHARED_PASS_HITS: AtomicU64 = AtomicU64::new(0);
+
+fn shared_passes() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("XCL_TWO_PASS_SHARE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// AddRef (`slot` 1) or Release (2) of a raw PC pipeline state: the count after it.
+unsafe fn raw_pso_ref(pso: usize, slot: usize) -> u32 {
+    if pso == 0 {
+        return 0;
+    }
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(pso as *const *const usize)).add(slot));
+    f(pso as *mut c_void)
+}
+
+/// The compute pass another two-pass pipeline already has for `key`, with a reference for the
+/// caller.
+fn shared_pass(key: (u64, usize, i32)) -> Option<usize> {
+    if !shared_passes() {
+        return None;
+    }
+    let g = SHARED_PASSES.lock().unwrap();
+    let pso = *g.as_ref()?.get(&key)?;
+    unsafe { raw_pso_ref(pso, 1) };
+    let n = SHARED_PASS_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: {n} two-pass pipelines share the compute pass of another one");
+    }
+    Some(pso)
 }
 
 static TWO_PASS: Mutex<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = Mutex::new(None);
@@ -5838,11 +5950,20 @@ unsafe fn finish_two_pass(
     }
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
+    // lab: the compute pass another pipeline of this MS has
+    let shared = shared_pass(ckey);
+    if let Some(p) = shared {
+        compute = p as *mut c_void;
+    }
     // logged with the console MS's hash and whether a driver blob was supplied (huge programs,
     // or all with `XCL_PSO_TRACE=1`)
-    let (mut hc, mut cin_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, Some((ms_hash, ccached.is_some())), || {
-        driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
-    });
+    let (mut hc, mut cin_driver) = if shared.is_some() {
+        (0, std::time::Duration::ZERO)
+    } else {
+        driver_compile_identified("compute pass", tp.cs.len(), false, Some((ms_hash, ccached.is_some())), || {
+            driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
+        })
+    };
     if hc < 0 && ccached.is_some() {
         forget_compute_blob(ckey);
         if cfrom_disk {
@@ -5856,8 +5977,9 @@ unsafe fn finish_two_pass(
         hc = retried;
         cin_driver += took;
     }
-    let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
-    if hc >= 0 && !creused && !compute.is_null() {
+    let creused = shared.is_some() || hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
+    if shared.is_some() {
+    } else if hc >= 0 && !creused && !compute.is_null() {
         keep_compute_blob(ckey, compute, tp.cs.len());
         if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
             driver_cache::keep(p, &b, cin_driver);
@@ -5874,7 +5996,11 @@ unsafe fn finish_two_pass(
         return E_INVALIDARG;
     }
     note_pso_rs(*ppv, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind, ms_hash }));
+    if shared.is_none() && shared_passes() {
+        // (another thread's pass of the same program may be there by now: that one stays)
+        SHARED_PASSES.lock().unwrap().get_or_insert_with(HashMap::new).entry(ckey).or_insert(compute as usize);
+    }
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind, ms_hash, pass_key: ckey }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
         crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
@@ -7208,6 +7334,9 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    if let Some(code) = super::pso_async::code_now() {
+        crate::xlog_error!("shader code lab: at the removal: {code}");
+    }
     unsafe {
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
         if let Ok(pf) = dred.GetPageFaultAllocationOutput() {

@@ -127,6 +127,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     clamp_made,
                     crate::hle::d3d12x::vram::page_breakdown()
                 );
+                // lab: the compiled code of the pipelines in use (`XCL_PSO_CODE`, `XCL_PSO_CODE_MB`)
+                if let Some(line) = crate::hle::d3d12x::pso_async::code_tick() {
+                    crate::xlog_info!("shader code lab: {line}");
+                }
                 // lab: every 10 s, how much of each memory window is in the working set
                 // (pages the title or XCL touched and Windows has not trimmed)
                 ticks += 1;
@@ -143,6 +147,36 @@ pub fn host_main(boot_path: &Path) -> i32 {
                         // the title's memory past the windows (the CPU view of its 24 GB GPU view)
                         let end = u.base() + (u.shader_windows() << 32);
                         crate::xlog_info!("memory lab: in the working set: {} MB of the 24 GB after the windows ({end:#x}..)", mb(resident_bytes(end, 24 << 30)));
+                    }
+                }
+                // lab (`XCL_TRIM_VIEWS=1`): every 2 s, the mapped views of 256 MB or more are taken
+                // out of the working set. The NVIDIA driver maps its 4 GB shader cache file
+                // (NVIDIA/DXCache/*.nvph under %LOCALAPPDATA%) and reads 3.5 GB of it within
+                // seconds some 30 s into a retail title's world: runs died of RAM there before
+                // the 30 s walk below got to it.
+                if std::env::var("XCL_TRIM_VIEWS").is_ok_and(|v| v.trim() == "1") {
+                    use windows_sys::Win32::System::Memory::{VirtualQuery, VirtualUnlock, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_MAPPED};
+                    let mut views: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+                    let mut at = 0x1_0000usize;
+                    while at < 0x7FFF_FFFE_0000 {
+                        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                        if unsafe { VirtualQuery(at as *const _, &mut m, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 || m.RegionSize == 0 {
+                            break;
+                        }
+                        if m.State == MEM_COMMIT && m.Type == MEM_MAPPED {
+                            let e = views.entry(m.AllocationBase as usize).or_insert(0);
+                            *e = (*e).max(m.BaseAddress as usize + m.RegionSize - m.AllocationBase as usize);
+                        }
+                        at = m.BaseAddress as usize + m.RegionSize;
+                    }
+                    for (&b, &span) in views.iter().filter(|e| *e.1 >= 256 << 20) {
+                        unsafe { VirtualUnlock(b as *const _, span) };
+                        static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+                        let mut seen = SEEN.lock().unwrap();
+                        if !seen.contains(&b) {
+                            seen.push(b);
+                            crate::xlog_info!("memory lab: mapped view of {} MB at {b:#x}: taken out of the working set every 2 s from now", span >> 20);
+                        }
                     }
                 }
                 // lab: every 30 s, the working set by allocation (VirtualQuery over the whole
