@@ -202,15 +202,23 @@ unsafe fn scratch(dev: &ID3D12Device, allocator: usize, bytes: u64) -> Option<ID
 /// The GPU is done with what lists recorded from `allocator` (reset or released): its copies
 /// can be reused.
 pub(super) fn allocator_reset(allocator: usize) {
-    let mut g = SCRATCH.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    if let Some(done) = s.held.remove(&allocator) {
-        s.free.extend(done);
-        if s.free.len() > FREE_KEPT {
-            s.free.sort_by_key(|e| std::cmp::Reverse(e.1));
-            s.free.truncate(FREE_KEPT);
+    // the buffers over `FREE_KEPT` are released after the lock: a buffer's last Release takes
+    // the sparse state's lock (`real::res_release` → `sparse::forget_buffer`), and a thread
+    // holding that one resets an allocator (`sparse::readback_after_execute`) and comes here –
+    // the two stopped each other and every title thread behind them (lab: found in a world run)
+    let mut over = Vec::new();
+    {
+        let mut g = SCRATCH.lock().unwrap();
+        let Some(s) = g.as_mut() else { return };
+        if let Some(done) = s.held.remove(&allocator) {
+            s.free.extend(done);
+            if s.free.len() > FREE_KEPT {
+                s.free.sort_by_key(|e| std::cmp::Reverse(e.1));
+                over = s.free.split_off(FREE_KEPT);
+            }
         }
     }
+    drop(over);
 }
 
 /// Where `bytes` at console offset `offset` of console buffer `res` are on the GPU: the GPU
