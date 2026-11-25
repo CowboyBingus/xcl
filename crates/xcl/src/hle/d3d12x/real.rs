@@ -5428,6 +5428,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
         }
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
+    let console_ps = ps;
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
@@ -5474,7 +5475,27 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             let _ = std::fs::write(f, ms);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", ms_hash, riid, ppv))
+    // lab: the pipeline's console PS, by the compute pass (`two_pass_ps_hash`), and its container
+    let ps_hash = console_ps.map_or(0, crate::gpu::shader::fnv64);
+    if let (Some(dir), Some(ps)) = (std::env::var_os("XCL_MS_DUMP_DIR"), console_ps) {
+        let f = std::path::Path::new(&dir).join(format!("{ps_hash:016x}.ps"));
+        if !f.exists() {
+            let _ = std::fs::write(f, ps);
+        }
+    }
+    let hr = finish_two_pass(this, &out, tp, rs, "MS", ms_hash, riid, ppv);
+    if hr >= 0 && !ppv.is_null() {
+        if let Some(tp) = TWO_PASS.lock().unwrap().as_ref().and_then(|m| m.get(&(*ppv as usize)).cloned()) {
+            TWO_PASS_PS.lock().unwrap().get_or_insert_with(HashMap::new).insert(tp.compute, ps_hash);
+        }
+    }
+    Some(hr)
+}
+
+/// lab: compute pass of a two-pass MS pipeline → FNV-1a of its console PS container
+static TWO_PASS_PS: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+pub fn two_pass_ps_hash(compute: usize) -> u64 {
+    TWO_PASS_PS.lock().unwrap().as_ref().and_then(|m| m.get(&compute).copied()).unwrap_or(0)
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline

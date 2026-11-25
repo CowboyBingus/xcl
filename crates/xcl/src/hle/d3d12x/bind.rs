@@ -916,6 +916,23 @@ unsafe fn ms_probe(this: *mut c_void, what: &str, tp: &super::real::TwoPassPso, 
     if crate::log::uptime() < from {
         return;
     }
+    {
+        // which pipelines the two-pass draws use: (MS, PS) → (draws, groups), the most used logged
+        static USE: Mutex<Option<HashMap<(u64, u64), (u64, u64)>>> = Mutex::new(None);
+        static TOTAL: AtomicU64 = AtomicU64::new(0);
+        let ps = super::real::two_pass_ps_hash(tp.compute);
+        let mut g = USE.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        let e = m.entry((tp.ms_hash, ps)).or_default();
+        e.0 += 1;
+        e.1 += u64::from(groups);
+        let n = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= 4096 && n.is_power_of_two() {
+            let mut v: Vec<_> = m.iter().map(|(k, v)| (*v, *k)).collect();
+            v.sort_unstable_by(|a, b| b.cmp(a));
+            crate::xlog_info!("ms probe: {n} two-pass draws with {} (MS, PS) pairs; most used (draws/groups MS+PS): {}", v.len(), v.iter().take(40).map(|((d, gr), (ms, ps))| format!("{d}/{gr} {ms:016x}+{ps:016x}")).collect::<Vec<_>>().join(", "));
+        }
+    }
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static LOGGED: AtomicU64 = AtomicU64::new(0);
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
