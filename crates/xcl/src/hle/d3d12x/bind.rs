@@ -370,7 +370,16 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
     };
     let entry = match picked {
         Some(e) => e,
-        None => (default_uav_buffer(&dev, need, "two-pass res buffer")?, need, dev_key),
+        None => {
+            // lab: how much video memory the record buffers take
+            static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let (n, made) = (N.fetch_add(1, Ordering::Relaxed) + 1, MADE.fetch_add(need, Ordering::Relaxed) + need);
+            if n <= 4 || n.is_power_of_two() || n % 32 == 0 {
+                crate::xlog_info!("D3D12.X: two-pass record buffer #{n} of {} MiB made ({} MiB made so far, {} free)", need >> 20, made >> 20, FREE_RES.lock().unwrap().len());
+            }
+            (default_uav_buffer(&dev, need, "two-pass res buffer")?, need, dev_key)
+        }
     };
     let buf = entry.0.clone();
     let va = buf.GetGPUVirtualAddress();
@@ -599,7 +608,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             // garbage record hung the GPU here (0x887a0006). Both passes read the bounded copy.
             // The compute pass writes one record per group into `res` (a root UAV: no bounds
             // check), so the groups are also limited to the records the buffer holds.
-            const RES_BYTES: u64 = 32 << 20;
+            // lab: `XCL_TWO_PASS_RES_MB` (default 32)
+            static RES_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            #[allow(non_snake_case)]
+            let RES_BYTES: u64 = *RES_MB.get_or_init(|| std::env::var("XCL_TWO_PASS_RES_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(32u64).clamp(1, 128)) << 20;
             let rec_bytes = (tp.record.record_dwords() as u64 * 4).max(4);
             let budget = (RES_BYTES / rec_bytes).saturating_mul(128).min(u64::from(super::indirect_clamp::BUDGET)) as u32;
             let bounded = super::indirect_clamp::bound_within(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off, budget);
