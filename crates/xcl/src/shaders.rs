@@ -988,7 +988,13 @@ fn export_hlsl(input: &Input, dir: &Path, min_kb: usize, count: usize, windows: 
         }
         // lab: a console MS exports its compute pass
         let is_ms = xbox::parse(&blob).is_some_and(|sh| sh.stage == "MS");
-        if !is_ms && !is_compute_container(&blob) {
+        // lab: a console PS / VS named by its file or hash exports too
+        let gfx = xbox::parse(&blob).and_then(|sh| match sh.stage.as_str() {
+            "PS" => Some(recomp::pso::Stage::Pixel),
+            "VS" => Some(recomp::pso::Stage::Vertex),
+            _ => None,
+        }).filter(|_| input.len() == 1 || record_hash.is_some());
+        if !is_ms && gfx.is_none() && !is_compute_container(&blob) {
             if record_hash.is_some() {
                 matched = true;
                 failures += 1;
@@ -998,7 +1004,7 @@ fn export_hlsl(input: &Input, dir: &Path, min_kb: usize, count: usize, windows: 
             continue;
         }
         matched = true;
-        let hlsl = match if is_ms { lab_ms_hlsl(&blob, windows, split) } else { recomp::pso::console_hlsl(&blob, recomp::pso::Stage::Compute, windows, split) } {
+        let hlsl = match if is_ms { lab_ms_hlsl(&blob, windows, split) } else { recomp::pso::console_hlsl(&blob, gfx.unwrap_or(recomp::pso::Stage::Compute), windows, split && gfx.is_none()) } {
             Ok((hlsl, _)) => hlsl,
             Err(e) => {
                 failures += 1;
