@@ -264,8 +264,13 @@ struct State {
     /// decommits and commits again thousands of tiles a second, and each `UpdateTileMappings`
     /// took ~0.15 ms.)
     parked: FxHashMap<usize, (u32, u32)>,
-    /// placed buffers → the pool tiles they use
-    buffers: FxHashMap<usize, Vec<(u32, u32)>>,
+    /// tile address → pool tile of decommitted tiles a placed buffer uses: they stay mapped in
+    /// their window until the buffer is gone. Memory committed there again is then the same for
+    /// the window (what shaders write) and the buffer (what an ExecuteIndirect or a copy of the
+    /// title reads); with a new tile in the window the buffer kept the old one, with old bytes
+    kept: FxHashMap<usize, (u32, u32)>,
+    /// placed buffers → the tiles they use (address, pool tile)
+    buffers: FxHashMap<usize, Vec<(usize, (u32, u32))>>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
     to_zero: Vec<(usize, usize)>,
     /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped)
@@ -676,6 +681,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         mapped: FxHashMap::default(),
         pinned: FxHashMap::default(),
         parked: FxHashMap::default(),
+        kept: FxHashMap::default(),
         buffers: FxHashMap::default(),
         to_zero: Vec::new(),
         staging: None,
@@ -956,7 +962,7 @@ impl State {
         while t < end {
             if !self.mapped.contains_key(&t) && self.window_index(t).is_some() {
                 // still mapped there: no new mapping, what it held is cleared
-                if let Some(tile) = self.parked.remove(&t) {
+                if let Some(tile) = self.parked.remove(&t).or_else(|| self.kept.remove(&t)) {
                     self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
                     self.runs = None;
                     self.to_zero.push((t, TILE));
@@ -1846,9 +1852,18 @@ impl State {
         }
     }
 
-    /// a pool tile no window maps, none is parked on and no buffer uses goes back to the free list
-    fn release_if_unused(&mut self, tile: (u32, u32)) {
-        if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) && !self.parked.values().any(|&p| p == tile) {
+    /// A pool tile a buffer used at `t` goes back to the free list, unless its window maps it, it
+    /// is parked there, or another buffer uses it. Kept mapped for the buffer: parked from here on.
+    fn release_if_unused(&mut self, t: usize, tile: (u32, u32)) {
+        if self.pinned.contains_key(&tile) {
+            return;
+        }
+        if self.kept.get(&t) == Some(&tile) {
+            self.kept.remove(&t);
+            self.parked.insert(t, tile);
+            return;
+        }
+        if self.mapped.get(&t).is_none_or(|e| e.pool != tile) && self.parked.get(&t) != Some(&tile) {
             self.free.push(tile);
         }
     }
@@ -1862,12 +1877,18 @@ impl State {
         }
         let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
         for (t, tile) in std::mem::take(&mut self.parked) {
+            // (a placed buffer uses it)
+            if self.pinned.contains_key(&tile) {
+                self.kept.insert(t, tile);
+                continue;
+            }
             if let Some(wi) = self.window_index(t) {
                 by_window.entry(wi).or_default().push(t);
             }
-            if !self.pinned.contains_key(&tile) {
-                self.free.push(tile);
-            }
+            self.free.push(tile);
+        }
+        if by_window.is_empty() {
+            return false;
         }
         for (wi, ts) in by_window {
             let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
@@ -2049,7 +2070,7 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
-    s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
+    s.buffers.insert(raw as usize, tiles);
     s.signal();
     Some((hr, delta))
 }
@@ -2089,12 +2110,12 @@ pub fn forget_buffer(res: usize) {
 
 fn forget_in(s: &mut State, res: usize) {
     let Some(tiles) = s.buffers.remove(&res) else { return };
-    for tile in tiles {
+    for (t, tile) in tiles {
         if let Some(c) = s.pinned.get_mut(&tile) {
             *c -= 1;
             if *c == 0 {
                 s.pinned.remove(&tile);
-                s.release_if_unused(tile);
+                s.release_if_unused(t, tile);
             }
         }
     }
@@ -2189,6 +2210,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                kept: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
@@ -2339,6 +2361,7 @@ mod tests {
                 free: Vec::new(),
                 retired: Vec::new(),
                 parked: FxHashMap::default(),
+                kept: FxHashMap::default(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 buffers: FxHashMap::default(),
@@ -2551,6 +2574,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                kept: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
@@ -2653,6 +2677,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                kept: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
@@ -2683,7 +2708,7 @@ mod tests {
             assert_eq!(s.parked.get(&base), Some(&tile));
             assert!(!s.free.contains(&tile));
             assert_eq!(s.value, v, "no tile mapping changed");
-            s.release_if_unused(tile);
+            s.release_if_unused(base, tile);
             assert!(!s.free.contains(&tile), "a parked tile is not free");
 
             // committed again: the same tile, cleared, no new mapping
@@ -2714,6 +2739,29 @@ mod tests {
             assert!(s.parked.is_empty());
             assert_eq!(s.mapped[&(base + TILE)].pool, tile);
             assert!(!s.mapped.contains_key(&base));
+
+            // a placed buffer uses the tile: the window keeps it when it is decommitted and
+            // flushed, memory committed there again is the buffer's, and it is free only once
+            // the buffer is gone and it was decommitted
+            *s.pinned.entry(tile).or_default() += 1;
+            let at = base + TILE;
+            s.decommit_range(at, TILE);
+            assert!(!s.flush_parked(), "nothing to unmap");
+            assert_eq!(s.kept.get(&at), Some(&tile));
+            assert!(!s.free.contains(&tile));
+            let v = s.value;
+            s.to_zero.clear();
+            s.commit_range(at, TILE);
+            assert_eq!(s.mapped[&at].pool, tile, "the buffer's tile");
+            assert_eq!(s.to_zero, vec![(at, TILE)]);
+            assert_eq!(s.value, v, "no tile mapping changed");
+            s.decommit_range(at, TILE);
+            assert!(!s.flush_parked());
+            s.pinned.remove(&tile);
+            s.release_if_unused(at, tile);
+            assert!(s.kept.is_empty() && !s.free.contains(&tile));
+            assert!(s.flush_parked());
+            assert!(s.free.contains(&tile));
 
             s.wait_for(s.value);
             drop(s);
