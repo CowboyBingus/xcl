@@ -628,6 +628,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 Some(b) => (b.raw(), 0),
                 None => (args, args_off),
             };
+            ei_peek(this, 0, max, args, args_off + u64::from(msig.mesh_offset), count_buf, count_off);
             let run = (|| -> Result<(), String> {
                 let (res_buf, res_va) = ensure_res_buffer(this, RES_BYTES)?;
                 bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
@@ -712,6 +713,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // the records bounded on the GPU first (a garbage record would hang it): this changes the
     // list's compute bindings, which `bind_abi` sets again
     let bounded = super::indirect_clamp::bound(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off);
+    match &bounded {
+        Some(b) => ei_peek(this, if gfx { 1 } else { 2 }, max, b.raw(), 0, count_buf, count_off),
+        None => ei_peek(this, if gfx { 1 } else { 2 }, max, args, args_off, count_buf, count_off),
+    }
     let result = bind_abi(this, list, pso, gfx);
     if let Ok(()) = result {
         count(if gfx { DRAWS } else { DISPATCHES });
@@ -729,6 +734,129 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
         }
+    }
+}
+
+// lab: `XCL_EI_PEEK=t` (seconds of uptime): from then on the arguments (12 bytes at the action)
+// and the count of up to 4096 ExecuteIndirect calls are copied to a readback buffer when the
+// call runs on the GPU, and logged 8, 16 and 30 s after the first.
+struct EiPeek {
+    rb: ID3D12Resource,
+    /// (uptime, kind 0 two-pass mesh / 1 graphics / 2 compute, max, has count)
+    meta: Vec<(f64, u8, u32, bool)>,
+}
+unsafe impl Send for EiPeek {}
+static EI_PEEK: Mutex<Option<EiPeek>> = Mutex::new(None);
+const EI_PEEK_SLOTS: usize = 4096;
+
+fn ei_peek_from() -> Option<f64> {
+    static T: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("XCL_EI_PEEK").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+unsafe fn ei_peek(this: *mut c_void, kind: u8, max: u32, args: usize, args_at: u64, count_buf: usize, count_off: u64) {
+    let Some(from) = ei_peek_from() else { return };
+    if crate::log::uptime() < from || args == 0 {
+        return;
+    }
+    let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    let mut g = EI_PEEK.lock().unwrap();
+    if g.is_none() {
+        let Some(dev) = super::real::list_device(this) else { return };
+        let mut rb: Option<ID3D12Resource> = None;
+        let made = dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: (EI_PEEK_SLOTS * 32) as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut rb,
+        );
+        let (Ok(()), Some(rb)) = (made, rb) else { return };
+        // marks: a slot the GPU has not written yet reads 0xEEEEEEEE
+        let mut p: *mut c_void = std::ptr::null_mut();
+        if rb.Map(0, None, Some(&mut p)).is_ok() && !p.is_null() {
+            std::ptr::write_bytes(p as *mut u8, 0xEE, EI_PEEK_SLOTS * 32);
+            rb.Unmap(0, None);
+        }
+        *g = Some(EiPeek { rb, meta: Vec::new() });
+        let _ = std::thread::Builder::new().name("xcl-ei-peek".into()).spawn(|| {
+            for wait in [8u64, 8, 14] {
+                std::thread::sleep(std::time::Duration::from_secs(wait));
+                ei_peek_report();
+            }
+        });
+    }
+    let Some(pk) = g.as_mut() else { return };
+    let slot = pk.meta.len();
+    if slot >= EI_PEEK_SLOTS {
+        return;
+    }
+    let a = args as *mut c_void;
+    let Some(a) = ID3D12Resource::from_raw_borrowed(&a) else { return };
+    list.CopyBufferRegion(&pk.rb, (slot * 32) as u64, a, args_at, 12);
+    let c = count_buf as *mut c_void;
+    let has_count = match ID3D12Resource::from_raw_borrowed(&c) {
+        Some(c) if count_buf != 0 => {
+            list.CopyBufferRegion(&pk.rb, (slot * 32 + 16) as u64, c, count_off, 4);
+            true
+        }
+        _ => false,
+    };
+    pk.meta.push((crate::log::uptime(), kind, max, has_count));
+}
+
+fn ei_peek_report() {
+    let g = EI_PEEK.lock().unwrap();
+    let Some(pk) = g.as_ref() else { return };
+    unsafe {
+        let mut p: *mut c_void = std::ptr::null_mut();
+        if pk.rb.Map(0, None, Some(&mut p)).is_err() || p.is_null() {
+            return;
+        }
+        let w = |slot: usize, k: usize| (p as *const u32).add(slot * 8 + k).read_unaligned();
+        for kind in 0..3u8 {
+            let (mut n, mut pending, mut zero_args, mut zero_count, mut groups) = (0u32, 0u32, 0u32, 0u32, 0u64);
+            let mut examples = Vec::new();
+            for (slot, &(t, k, max, has_count)) in pk.meta.iter().enumerate() {
+                if k != kind {
+                    continue;
+                }
+                n += 1;
+                let (x, y, z, c) = (w(slot, 0), w(slot, 1), w(slot, 2), w(slot, 4));
+                if x == 0xEEEE_EEEE {
+                    pending += 1;
+                    continue;
+                }
+                let empty = if kind == 2 || kind == 0 { x == 0 || y == 0 || z == 0 } else { x == 0 || y == 0 };
+                if empty {
+                    zero_args += 1;
+                }
+                if has_count && c == 0 {
+                    zero_count += 1;
+                }
+                if !empty && !(has_count && c == 0) {
+                    groups += x as u64 * if kind == 1 { y as u64 } else { y as u64 * z as u64 };
+                }
+                if examples.len() < 40 && (slot % 7 == 0 || !empty) {
+                    examples.push(format!("{t:.1}s max {max} [{x:#x} {y:#x} {z:#x}]{}", if has_count { format!(" count {c:#x}") } else { String::new() }));
+                }
+            }
+            crate::xlog_info!(
+                "ei peek: kind {kind} (0 two-pass mesh, 1 graphics, 2 compute): {n} calls, {pending} not run yet, {zero_args} with empty arguments, {zero_count} with count 0, work of the rest {groups}; {}",
+                examples.join("; ")
+            );
+        }
+        pk.rb.Unmap(0, None);
     }
 }
 
