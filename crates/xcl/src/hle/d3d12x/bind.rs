@@ -599,7 +599,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             // garbage record hung the GPU here (0x887a0006). Both passes read the bounded copy.
             // The compute pass writes one record per group into `res` (a root UAV: no bounds
             // check), so the groups are also limited to the records the buffer holds.
-            const RES_BYTES: u64 = 64 << 20;
+            const RES_BYTES: u64 = 32 << 20;
             let rec_bytes = (tp.record.record_dwords() as u64 * 4).max(4);
             let budget = (RES_BYTES / rec_bytes).saturating_mul(128).min(u64::from(super::indirect_clamp::BUDGET)) as u32;
             let bounded = super::indirect_clamp::bound_within(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off, budget);
