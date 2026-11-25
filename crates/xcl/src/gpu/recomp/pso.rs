@@ -754,6 +754,21 @@ fn direct_fallback(stage: &str, err: &str) {
     crate::xlog_info!("[SHADER] direct DXIL fallback stage={stage} reason=\"{reason}\" detail=\"{}\" – HLSL path", err.lines().next().unwrap_or(""));
 }
 
+/// Whether the program takes an address in its code region for something else than a far jump
+/// (`rdna2::resolve_far_jumps`): an `s_getpc_b64` the compiler emits to reach the constant
+/// data after the program.
+fn takes_code_address(code: &[u8]) -> bool {
+    let mut insts = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { return false };
+        off += d.len;
+        insts.push(d);
+    }
+    crate::gpu::rdna2::resolve_far_jumps(&mut insts);
+    (0..insts.len()).any(|i| insts[i].inst.name == "S_GETPC_B64" && !insts.get(i + 3).is_some_and(|s| s.far_target.is_some()))
+}
+
 /// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
 /// FSPX (driver) containers are left to the HLSL path.
 pub(crate) fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
@@ -762,6 +777,11 @@ pub(crate) fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
+    // the direct translator has no place for the constant data a program reads from its own
+    // code region (`Options::rodata`): such a program stays on the HLSL path
+    if !f.rodata(p).is_empty() && takes_code_address(code) {
+        return Err("constant data in the code region (s_getpc_b64)".into());
+    }
     let wave64 = super::detect_wave64(code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
@@ -853,7 +873,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, rodata: f.rodata(p), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -947,7 +967,8 @@ pub fn console_mesh_in(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool, windo
             Err(e) => direct_fallback("MS", &e),
         }
     }
-    finish_two_pass(super::translate_mesh(code, ms.clone(), wave64, split_wave64, windows)?, record, ps)
+    let t = translate(code, &Options { mode: Mode::Mesh(ms.clone()), wave64, split_wave64, mem_windows: windows, rodata: f.rodata(p), ..Default::default() })?;
+    finish_two_pass(t, record, ps)
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
