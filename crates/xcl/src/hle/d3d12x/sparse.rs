@@ -488,7 +488,7 @@ unsafe fn wait_released(g: MutexGuard<'static, Option<State>>, value: u64) -> (M
     let Some(fence) = g.as_ref().map(|s| s.fence.clone()) else { return (g, false) };
     drop(g);
     let reached = wait_fence(&fence, value);
-    let g = STATE.lock().unwrap();
+    let g = lock_state();
     let same = g.as_ref().is_some_and(|s| s.fence.as_raw() == fence.as_raw());
     (g, reached && same)
 }
@@ -550,7 +550,7 @@ unsafe fn readback_released(mut g: MutexGuard<'static, Option<State>>, ranges: &
 
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
-    let g = STATE.lock().unwrap();
+    let g = lock_state();
     let Some(s) = g.as_ref() else { return (0, 0) };
     let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
     (pools, pools.saturating_sub(s.free.len() * TILE))
@@ -707,7 +707,7 @@ const SHADOW_POOL: u32 = u32::MAX;
 /// All of it counts as mapped from the start: the window is committed. False: no queue for
 /// the copies (the buffer then never sees the CPU's writes).
 pub unsafe fn shadow_window(dev: &ID3D12Device, base: usize, size: usize, buf: &ID3D12Resource) -> bool {
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     if g.is_none() {
         // no sparse window was made (`init`): the copies still need the queue and the lists
         match new_state(dev, Vec::new()) {
@@ -1566,7 +1566,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     if ranges.is_empty() {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     let merged = s.after_execute(queue, ranges);
     if merged.is_empty() {
@@ -1576,7 +1576,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     // and is waited for with `STATE` released (`READBACK` is taken before `STATE`)
     drop(g);
     let _one = READBACK.lock().unwrap();
-    readback_released(STATE.lock().unwrap(), &merged);
+    readback_released(lock_state(), &merged);
 }
 
 /// copies back submitted and not landed yet, and whether any ran on the readback queue
@@ -1594,7 +1594,7 @@ pub unsafe fn settle_readbacks() {
     if RB_PENDING.load(Ordering::Acquire) == 0 {
         return;
     }
-    settle_released(STATE.lock().unwrap(), true);
+    settle_released(lock_state(), true);
 }
 
 /// `drain_readbacks(Drain::TitleDone)` of the state, the wait for a copy whose title work is
@@ -1614,7 +1614,7 @@ unsafe fn settle_released(mut g: MutexGuard<'static, Option<State>>, patient: bo
         drop(g);
         // the title's lists are done: only the copy itself is left
         let reached = wait_fence(&done, done_v);
-        g = if patient { STATE.lock().unwrap() } else { try_state()? };
+        g = if patient { lock_state() } else { try_state()? };
         if !reached {
             return Some(g);
         }
@@ -1710,7 +1710,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         return;
     }
     let _one = READBACK.lock().unwrap();
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     if g.as_ref().is_none_or(|s| s.window_index(va).is_none()) {
         return;
     }
@@ -1767,7 +1767,7 @@ pub unsafe fn committed(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_add(&mut EARLY.lock().unwrap(), start, end);
@@ -1783,7 +1783,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_remove(&mut EARLY.lock().unwrap(), start, end);
@@ -1881,7 +1881,7 @@ impl State {
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return Vec::new() };
     if s.runs.is_none() {
         let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
@@ -1915,7 +1915,7 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// lock, the room waited for with it released.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.drain_readbacks(Drain::Finished);
     // the title's work sees what was decommitted unmapped, as it was
@@ -2016,7 +2016,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let s = g.as_mut()?;
     let start = va & !(TILE - 1);
     let delta = va - start;
@@ -2054,10 +2054,40 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     Some((hr, delta))
 }
 
-/// A placed buffer is gone: its tiles are not pinned by it any more.
-pub fn forget_buffer(res: usize) {
+/// Placed buffers released while `STATE` was held, let go by the next `lock_state`. Held only
+/// to push or take, never across a call out.
+static FORGOTTEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// `STATE`, with the buffers released while it was held let go first.
+fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
     let mut g = STATE.lock().unwrap();
+    forget_released(&mut g);
+    g
+}
+
+fn forget_released(g: &mut Option<State>) {
+    let gone = std::mem::take(&mut *FORGOTTEN.lock().unwrap());
     let Some(s) = g.as_mut() else { return };
+    for res in gone {
+        forget_in(s, res);
+    }
+}
+
+/// A placed buffer is gone: its tiles are not pinned by it any more. This runs from the
+/// resource's last Release, which D3D12 can make while it holds a lock of its own (in a title's
+/// command list Reset), and `before_execute` calls D3D12 with `STATE` held: waiting for `STATE`
+/// here deadlocked the two threads. So it does not wait: with `STATE` held, the holder's next
+/// `lock_state` lets the buffer go.
+pub fn forget_buffer(res: usize) {
+    FORGOTTEN.lock().unwrap().push(res);
+    match STATE.try_lock() {
+        Ok(mut g) => forget_released(&mut g),
+        Err(std::sync::TryLockError::WouldBlock) => {}
+        Err(e) => panic!("sparse state: {e}"),
+    }
+}
+
+fn forget_in(s: &mut State, res: usize) {
     let Some(tiles) = s.buffers.remove(&res) else { return };
     for tile in tiles {
         if let Some(c) = s.pinned.get_mut(&tile) {
@@ -2073,6 +2103,39 @@ pub fn forget_buffer(res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `f` on another thread while this one holds the sparse state (as `before_execute` does
+    /// around its D3D12 calls, which can wait for that thread): did `f` finish without waiting
+    /// for the state? The thread runs before the state is taken, so its start is not timed.
+    fn returns_while_the_state_is_held(f: impl FnOnce() + Send + 'static) -> bool {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let _ = go_rx.recv();
+            f();
+            let _ = tx.send(());
+        });
+        ready_rx.recv().unwrap();
+        let held = STATE.lock().unwrap();
+        go_tx.send(()).unwrap();
+        let done = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(held);
+        let joined = t.join();
+        assert!(joined.is_ok(), "the thread panicked: {joined:?}");
+        done.is_ok()
+    }
+
+    /// A placed buffer released while another thread holds the sparse state: the release does
+    /// not wait for the state, and the next `lock_state` lets the buffer go.
+    #[test]
+    fn a_buffer_released_while_the_state_is_held_does_not_wait_for_it() {
+        const RES: usize = 0x7ff0_dead_0000;
+        assert!(returns_while_the_state_is_held(|| forget_buffer(RES)), "forget_buffer waited for the sparse state's lock");
+        drop(lock_state());
+        assert!(!FORGOTTEN.lock().unwrap().contains(&RES));
+    }
 
     /// A copy back after a title submission does not wait for the title's queue: that queue can
     /// be waiting for work the title submits next, from the thread that is in here. The copy
