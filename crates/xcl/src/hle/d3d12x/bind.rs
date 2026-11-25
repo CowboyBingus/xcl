@@ -870,7 +870,7 @@ unsafe fn ms_probe(this: *mut c_void, what: &str, tp: &super::real::TwoPassPso, 
     static LOGGED: AtomicU64 = AtomicU64::new(0);
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let every = *EVERY.get_or_init(|| std::env::var("XCL_MS_PROBE_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16u64).max(1));
-    if CALLS.fetch_add(1, Ordering::Relaxed) % every != 0 || LOGGED.load(Ordering::Relaxed) >= 400 {
+    if CALLS.fetch_add(1, Ordering::Relaxed) % every != 0 || LOGGED.load(Ordering::Relaxed) >= 300 {
         return;
     }
     LOGGED.fetch_add(1, Ordering::Relaxed);
@@ -884,24 +884,24 @@ unsafe fn ms_probe(this: *mut c_void, what: &str, tp: &super::real::TwoPassPso, 
     };
     let fmt = |v: &Option<Vec<u32>>| v.as_ref().map_or("unreadable".to_string(), |v| v.iter().map(|x| format!("{x:x}")).collect::<Vec<_>>().join(" "));
     let table = u.base() + g(1) as usize;
-    let desc = cpu(table + 0x60, 4);
-    let mut line = format!("ms probe: {what} MS {:016x} groups {groups} threads {} maxv {} maxp {} vd {}; inline {} B of {}: s16.. = [{}]; table {table:#x} +0x60 = [{}]", tp.ms_hash, tp.record.threads, tp.record.max_vertices, tp.record.max_primitives, tp.record.vert_dwords(), inline_ms, args.len(), w.iter().map(|x| format!("{x:x}")).collect::<Vec<_>>().join(" "), fmt(&desc));
-    if let Some((b, o)) = super::real::uma_window_buffer(table + 0x60, 16) {
-        let slot = ei_peek_slot(this, 14, groups, b, o, b, o + 12);
-        line += &format!(" (gpu slot {slot:?})");
-    }
-    if let Some(d) = &desc {
+    let mut line = format!("ms probe: {what} MS {:016x} groups {groups} threads {} maxv {} maxp {} vd {}; inline {} B of {}: s16.. = [{}]; table {table:#x}", tp.ms_hash, tp.record.threads, tp.record.max_vertices, tp.record.max_primitives, tp.record.vert_dwords(), inline_ms, args.len(), w.iter().map(|x| format!("{x:x}")).collect::<Vec<_>>().join(" "));
+    // the eight V#s of the table (the meshlet buffer's slot differs per program)
+    for k in 0..8usize {
+        let desc = cpu(table + 0x20 * k, 4);
+        let Some(d) = &desc else { continue };
         let buf = ((d[1] as usize & 0xFFFF) << 32) | d[0] as usize;
+        if buf == 0 {
+            continue;
+        }
         // an address with no high part is in window 0 (as the shaders read it)
         let buf = if buf >> 32 == 0 { u.base() + buf } else { buf };
-        let m = cpu(buf, 8);
-        line += &format!("; meshlets at {buf:#x} (window {:?}, sparse {}): cpu [{}]", u.window_of(buf), u.is_sparse(buf), fmt(&m));
-        if let Some((b, o)) = super::real::uma_window_buffer(buf, 32) {
+        let m = cpu(buf, 16);
+        line += &format!(" | +{:#x} V# [{}] -> {buf:#x} win {:?} sparse {} cpu [{}]", 0x20 * k, fmt(&desc), u.window_of(buf), u.is_sparse(buf), fmt(&m));
+        if let Some((b, o)) = super::real::uma_window_buffer(buf, 64) {
             let s0 = ei_peek_slot(this, 12, groups, b, o, b, o + 12);
             let s1 = ei_peek_slot(this, 13, groups, b, o + 16, b, o + 28);
-            line += &format!(" (gpu slots {s0:?} {s1:?})");
-        } else {
-            line += " (no window buffer)";
+            let s2 = ei_peek_slot(this, 14, groups, b, o + 48, b, o + 60);
+            line += &format!(" gpu slots {} {} {}", s0.unwrap_or(0), s1.unwrap_or(0), s2.unwrap_or(0));
         }
     }
     crate::xlog_info!("{line}");

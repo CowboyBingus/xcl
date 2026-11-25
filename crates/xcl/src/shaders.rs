@@ -914,6 +914,24 @@ fn parse_record_hash(s: &str) -> Result<u64, String> {
     u64::from_str_radix(hex, 16).map_err(|e| e.to_string())
 }
 
+/// lab: the compute pass of a console MS (as `pso::console_mesh` translates it) + the pass-through
+fn lab_ms_hlsl(blob: &[u8], windows: u32, split: bool) -> Result<(String, &'static str), String> {
+    let sh = xbox::parse(blob).ok_or("not a console shader container")?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
+    let Some(recomp::Mode::Mesh(ms)) = recomp::interface(blob, &sh, f) else { return Err("not an MS".into()) };
+    let p = f.programs.first().ok_or("FSSM without a program")?;
+    let code = &f.data[p.offset..p.offset + p.len];
+    let wave64 = recomp::detect_wave64(code);
+    let t = recomp::translate_mesh(code, ms.clone(), wave64, split, windows)?;
+    Ok((format!("// MsInterface: {ms:?}
+// wave64 {wave64} split {split}
+{}
+/* ---- pass-through ----
+{}
+*/
+", t.hlsl, recomp::mesh_passthrough(&ms)), "cs_6_6"))
+}
+
 fn is_compute_container(blob: &[u8]) -> bool {
     if recomp::pso::fspx(blob).is_some() {
         return true;
@@ -967,7 +985,9 @@ fn export_hlsl(input: &Input, dir: &Path, min_kb: usize, count: usize, windows: 
         if exported.contains(&hash) {
             continue;
         }
-        if !is_compute_container(&blob) {
+        // lab: a console MS exports its compute pass
+        let is_ms = xbox::parse(&blob).is_some_and(|sh| sh.stage == "MS");
+        if !is_ms && !is_compute_container(&blob) {
             if record_hash.is_some() {
                 matched = true;
                 failures += 1;
@@ -977,7 +997,7 @@ fn export_hlsl(input: &Input, dir: &Path, min_kb: usize, count: usize, windows: 
             continue;
         }
         matched = true;
-        let hlsl = match recomp::pso::console_hlsl(&blob, recomp::pso::Stage::Compute, windows, split) {
+        let hlsl = match if is_ms { lab_ms_hlsl(&blob, windows, split) } else { recomp::pso::console_hlsl(&blob, recomp::pso::Stage::Compute, windows, split) } {
             Ok((hlsl, _)) => hlsl,
             Err(e) => {
                 failures += 1;
