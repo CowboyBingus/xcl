@@ -396,19 +396,27 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
 /// view heap (`list_x::title_view_heap`; `XCL_HEAP_SGPR=0`: not) – it was 0, and the world mesh
 /// programs that take their meshlet from a visible list (flags bit 28) read the list's V#
 /// from address 0 + slot * 32: every group then drew meshlet 0.
+/// The SGPR after it gets the address of the bound sampler heap (`list_x::title_sampler_heap`;
+/// `XCL_HEAP_SGPR=1`: the view heap alone): the world pixel shaders index both heaps themselves
+/// (264 of the 362 dumped: T# = s15 + i * 32, S# = s16 + i * 16, prim mask s17, after seven
+/// words of root arguments in s8..s14) – with 0 there every S# was read from the first bytes
+/// of window 0.
 fn heap_sgpr(list: *mut c_void, io: &mut Vec<u32>, known_layout: bool) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !known_layout || !*ON.get_or_init(|| !std::env::var("XCL_HEAP_SGPR").is_ok_and(|v| v.trim() == "0")) {
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| std::env::var("XCL_HEAP_SGPR").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2u32));
+    if !known_layout || mode == 0 {
         return;
     }
     let base = super::list_x::title_view_heap(list);
+    let samplers = if mode >= 2 { super::list_x::title_sampler_heap(list) } else { 0 };
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || n.is_power_of_two() {
-        crate::xlog_info!("D3D12.X: view heap SGPR: s{} = {base:#x} ({n} so far)", io.len());
+        crate::xlog_info!("D3D12.X: heap SGPRs: s{} = view heap {base:#x}, s{} = sampler heap {samplers:#x} ({n} so far)", io.len(), io.len() + 1);
     }
-    if base != 0 && io.len() < crate::gpu::recomp::IO_UMA_BASE_HI {
+    if base != 0 && io.len() + 1 < crate::gpu::recomp::IO_UMA_BASE_HI {
         io.push(base as u32);
+        io.push(samplers as u32);
     }
 }
 
@@ -449,7 +457,14 @@ unsafe fn bind_two_pass_stage(
         }
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
+    let user = io.len();
     heap_sgpr(this, &mut io, layout.is_some());
+    if !compute_pass {
+        ps_probe(tp, &io);
+        if io.len() > user {
+            draw_textures(&io, user);
+        }
+    }
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
@@ -924,6 +939,149 @@ unsafe fn ei_peek_slot(this: *mut c_void, kind: u8, max: u32, args: usize, args_
     };
     pk.meta.push((crate::log::uptime(), kind, max, has_count));
     Some(slot)
+}
+
+/// lab (`XCL_DRAW_TOUCH=0`: not): the textures a draw of the retail title samples, told to the
+/// page budget (`title_textures::drawn`). Its pixel shaders index the view heap themselves:
+/// the material's record – at the offset in the last root argument word (`io[heap - 1]`), in
+/// the buffer whose V# is at the global table (s8) + 0xac0 – holds the heap slots of its
+/// textures (239 of the 362 dumped PS load that V#; the record offsets they read are 0..64),
+/// T# = view heap (`io[heap]`) + slot * 32. Every dword of the record's first 68 bytes that is
+/// the slot of an image T# naming a texture on pages counts (one that is no slot names none,
+/// or at worst keeps one more texture). A record is looked at once in 250 ms.
+unsafe fn draw_textures(io: &[u32], heap: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| !std::env::var("XCL_DRAW_TOUCH").is_ok_and(|v| v.trim() == "0")) || !super::vram::tracking() || heap < 10 {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let at = |a: u64| if a >> 32 == 0 { u.base() + a as usize } else { a as usize };
+    let cpu = |p: usize, n: usize| -> Option<Vec<u32>> {
+        crate::gpu::shader::readable(p, 4 * n).then(|| (0..n).map(|i| ((p + 4 * i) as *const u32).read_unaligned()).collect())
+    };
+    let (table, record, view) = (io[8], io[heap - 1], io[heap]);
+    {
+        static SEEN: Mutex<Option<HashMap<(u32, u32), std::time::Instant>>> = Mutex::new(None);
+        let now = std::time::Instant::now();
+        let mut g = SEEN.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.get(&(table, record)).is_some_and(|t| now.duration_since(*t) < std::time::Duration::from_millis(250)) {
+            return;
+        }
+        if m.len() > 1 << 16 {
+            m.clear();
+        }
+        m.insert((table, record), now);
+    }
+    let Some(v) = cpu(at(table as u64) + 0xac0, 4) else { return };
+    let stride = (v[1] >> 16) & 0x3FFF;
+    let limit = if stride == 0 { v[2] } else { v[2].wrapping_mul(stride) };
+    let n = (limit.saturating_sub(record) / 4).min(17) as usize;
+    if n == 0 {
+        return;
+    }
+    let buf = at((u64::from(v[1] & 0xFFFF) << 32) | u64::from(v[0]));
+    let Some(rec) = cpu(buf.wrapping_add(record as usize), n) else { return };
+    let mut named = Vec::new();
+    for slot in rec {
+        if slot == 0 || slot >= 1 << 22 {
+            continue;
+        }
+        // an image descriptor (as `console_heap::referenced` tells one)
+        let Some(t) = cpu(at(view as u64) + slot as usize * 32, 4).filter(|t| t[3] >> 28 >= 8) else { continue };
+        if let Some(res) = super::console_heap::index_resource(t[0]) {
+            if !named.contains(&res) {
+                named.push(res);
+            }
+        }
+    }
+    super::title_textures::drawn(&named);
+}
+
+/// lab: `XCL_PS_PROBE=t` (seconds of uptime; `XCL_PS_PROBE_HASH`, default e1e597d212161b7e: the
+/// G-buffer pixel shader of MS_VS_TransformD; `XCL_PS_PROBE_EVERY`, default 8): where that
+/// program's textures come from, as the CPU sees the memory when the mesh pass is bound.
+/// `io` = its SGPRs: s8 the global table, s14 the material record's offset in the buffer whose
+/// V# is at table + 0xac0 (dwords 0, 1, 3, 4, 5 of the record = heap slots of the albedo
+/// (t111), t105, detail, t110 and normal (t144) textures), s15 / s16 the view and sampler heap
+/// (`heap_sgpr`): T# = s15 + slot * 32, S# = s16 + 0x430 / 0x4b0 / 0x520. Per T#: its 8 words,
+/// the heap slot it is in (PC index a view made there has), and the texture word 0 names.
+unsafe fn ps_probe(tp: &super::real::TwoPassPso, io: &[u32]) {
+    static CFG: std::sync::OnceLock<Option<(f64, u64, u64)>> = std::sync::OnceLock::new();
+    let Some((from, hash, every)) = *CFG.get_or_init(|| {
+        let from = std::env::var("XCL_PS_PROBE").ok()?.trim().parse().ok()?;
+        let hash = std::env::var("XCL_PS_PROBE_HASH").ok().and_then(|v| u64::from_str_radix(v.trim(), 16).ok()).unwrap_or(0xe1e5_97d2_1216_1b7e);
+        let every = std::env::var("XCL_PS_PROBE_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8u64).max(1);
+        Some((from, hash, every))
+    }) else {
+        return;
+    };
+    if crate::log::uptime() < from || super::real::two_pass_ps_hash(tp.compute) != hash {
+        return;
+    }
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if CALLS.fetch_add(1, Ordering::Relaxed) % every != 0 || LOGGED.fetch_add(1, Ordering::Relaxed) >= 48 {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let s = |i: usize| io.get(i).copied().unwrap_or(0);
+    // a 32-bit console address is in window 0 (as the shaders read it)
+    let at = |a: u64| if a >> 32 == 0 { u.base() + a as usize } else { a as usize };
+    let cpu = |p: usize, n: usize| -> Option<Vec<u32>> {
+        crate::gpu::shader::readable(p, 4 * n).then(|| (0..n).map(|i| ((p + 4 * i) as *const u32).read_unaligned()).collect())
+    };
+    let fmt = |v: &Option<Vec<u32>>| v.as_ref().map_or("unreadable".to_string(), |v| v.iter().map(|x| format!("{x:x}")).collect::<Vec<_>>().join(" "));
+    let heap = |p: usize| match super::console_heap::probe_slot(p as u64) {
+        Some((obj, k, sampler, visible, index)) => format!("{} heap {obj:#x} slot {k} visible {visible} pc index {index:?}", if sampler { "sampler" } else { "view" }),
+        None => "in no console heap".to_string(),
+    };
+    let mut line = format!("ps probe: PS {hash:016x} MS {:016x}: s8.. = [{}], {} SGPRs", tp.ms_hash, (8..18).map(|i| format!("{:x}", s(i))).collect::<Vec<_>>().join(" "), io.len());
+    let v = cpu(at(s(8) as u64) + 0xac0, 4);
+    line += &format!(" | index buffer V# [{}]", fmt(&v));
+    let mut slots = Vec::new();
+    if let Some(v) = &v {
+        let buf = at((u64::from(v[1] & 0xFFFF) << 32) | u64::from(v[0]));
+        let stride = (v[1] >> 16) & 0x3FFF;
+        let limit = if stride == 0 { v[2] } else { v[2].wrapping_mul(stride) };
+        let rec = cpu(buf.wrapping_add(s(14) as usize), 6);
+        line += &format!(" -> {buf:#x} win {:?} limit {limit:#x}, record +{:#x} = [{}]", u.window_of(buf), s(14), fmt(&rec));
+        if let Some(r) = rec.filter(|_| s(14).checked_add(24).is_some_and(|e| e <= limit)) {
+            slots = vec![("albedo", r[0]), ("t105", r[1]), ("detail", r[3]), ("t110", r[4]), ("normal", r[5])];
+        } else {
+            line += " (past the limit or unreadable: the program reads slot 0 five times)";
+            slots = vec![("slot 0", 0)];
+        }
+    }
+    for (name, slot) in slots {
+        let p = at(s(15) as u64).wrapping_add(slot as usize * 32);
+        let t = cpu(p, 8);
+        line += &format!(" | {name} slot {slot:#x}: T# at {p:#x} win {:?} [{}], {}", u.window_of(p), fmt(&t), heap(p));
+        let Some(t) = t else { continue };
+        match super::console_heap::index_resource(t[0]) {
+            Some(res) => {
+                line += &format!(", word 0 names texture {res:#x} evicted {}", super::vram::is_evicted(res));
+                match super::title_textures::probe_state(res) {
+                    Some((va, src, pending, gpu_written, unmapped, shadowed)) => {
+                        line += &format!(" at {va:#x} read from {src:#x} pending {pending} gpu-written {gpu_written} unmapped {unmapped} shadowed {shadowed}");
+                        let r = res as *mut c_void;
+                        if let Some(r) = ID3D12Resource::from_raw_borrowed(&r) {
+                            let d = r.GetDesc();
+                            line += &format!(" {}x{} format {} mips {}", d.Width, d.Height, d.Format.0, d.MipLevels);
+                        }
+                    }
+                    None => line += " (not kept in step with title memory)",
+                }
+            }
+            None => line += ", word 0 names no texture on pages",
+        }
+    }
+    for off in [0x430usize, 0x4b0, 0x520] {
+        let p = at(s(16) as u64) + off;
+        let w = cpu(p, 4);
+        line += &format!(" | S# +{off:#x} at {p:#x} [{}] -> sampler {:?}, {}", fmt(&w), w.as_ref().map(|w| w[3] & 0xFFF), heap(p));
+    }
+    crate::xlog_info!("{line}");
 }
 
 /// lab: `XCL_MS_PROBE=t`: what a two-pass mesh draw's program is given, for the retail title's
@@ -1733,7 +1891,11 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         Some(l) => console_list::user_data_for(l, user_sgprs, &args, table_at as u64),
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
+    let user = io.len();
     heap_sgpr(this, &mut io, layout.is_some());
+    if gfx && io.len() > user {
+        draw_textures(&io, user);
+    }
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;

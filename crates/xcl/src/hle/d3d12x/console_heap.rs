@@ -441,6 +441,28 @@ pub fn note_index(s: &Slot, res: usize) -> bool {
     true
 }
 
+/// lab (`XCL_PS_PROBE`): the console heap slot at address `at`, its page given no place by the
+/// asking: (heap, slot number, sampler heap, shader visible as the title made it, the PC index
+/// a descriptor made in the slot has – None: its page has no place in the shared heap yet).
+pub fn probe_slot(at: u64) -> Option<(usize, u32, bool, bool, Option<u32>)> {
+    let heaps = HEAPS.lock().unwrap();
+    let h = heaps.iter().find(|h| at >= h.shadow as u64 && at < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
+    let k = ((at - h.shadow as u64) / h.slot_bytes() as u64) as u32;
+    let index = if h.sampler {
+        Some(k)
+    } else if h.pages.is_empty() {
+        Some(2 * k)
+    } else {
+        h.pages.get((k / PAGE_SLOTS) as usize).filter(|&&first| first != UNMAPPED).map(|&first| first + 2 * (k % PAGE_SLOTS))
+    };
+    Some((h.obj, k, h.sampler, h.visible, index))
+}
+
+/// lab (`XCL_PS_PROBE`): the texture on pages the shared-heap SRV `index` (a T#'s word 0) names.
+pub fn index_resource(index: u32) -> Option<usize> {
+    INDEX_RES.lock().unwrap().as_ref()?.get(&index).copied()
+}
+
 /// The textures on pages whose T# is in a slot now: (in a shader-visible view heap, only in
 /// CPU-only ones).
 pub fn referenced() -> (Vec<usize>, Vec<usize>) {

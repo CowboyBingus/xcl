@@ -276,6 +276,8 @@ struct Bindings {
     heaps: Vec<usize>,
     /// lab: console address of the title's bound shader-visible view heap (0: none)
     title_view_heap: u64,
+    /// lab: console address of the title's bound sampler heap (0: none)
+    title_sampler_heap: u64,
     topology: Option<u32>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<windows::Win32::Foundation::RECT>,
@@ -431,6 +433,15 @@ pub(super) fn watch_dsv(dsv: usize) {
 /// arguments.
 pub(super) fn title_view_heap(list: *mut c_void) -> u64 {
     LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).map_or(0, |s| s.bindings.title_view_heap)
+}
+
+/// lab: the console address of the sampler heap the title bound on `list` (0: none). A program
+/// that indexes both heaps itself (SM 6.6 `ResourceDescriptorHeap[i]` / `SamplerDescriptorHeap[i]`:
+/// the retail title's world pixel shaders, `s_load_dwordx8 s[..], s[15:..], i * 32` and
+/// `s_load_dwordx4 s[..], s[16:17], i * 16`) has the view heap in the first user SGPR after its
+/// root arguments and the sampler heap in the next one.
+pub(super) fn title_sampler_heap(list: *mut c_void) -> u64 {
+    LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).map_or(0, |s| s.bindings.title_sampler_heap)
 }
 
 fn with_bindings(list: *mut c_void, f: impl FnOnce(&mut Bindings)) {
@@ -3615,7 +3626,7 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
     {
         // lab: where the title's view heap is in its memory (`title_view_heap`)
-        let mut base = 0u64;
+        let (mut base, mut samplers) = (0u64, 0u64);
         if !heaps.is_null() {
             for k in 0..n as usize {
                 let p = *heaps.add(k) as *mut c_void;
@@ -3623,14 +3634,22 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
                     continue;
                 }
                 let Some(h) = ID3D12DescriptorHeap::from_raw_borrowed(&p) else { continue };
-                if h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV {
+                let ty = h.GetDesc().Type;
+                if ty == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV {
                     if let Some(at) = super::console_heap::start(p as usize) {
                         base = at;
+                    }
+                } else if ty == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER {
+                    if let Some(at) = super::console_heap::start(p as usize) {
+                        samplers = at;
                     }
                 }
             }
         }
-        with_bindings(this, |b| b.title_view_heap = base);
+        with_bindings(this, |b| {
+            b.title_view_heap = base;
+            b.title_sampler_heap = samplers;
+        });
     }
     if heaps.is_null() || n == 0 {
         // no heaps: nothing bound any more (`ensure_view_heap` binds the shared heap again

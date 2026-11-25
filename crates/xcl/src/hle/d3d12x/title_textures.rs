@@ -642,6 +642,18 @@ pub fn address(res: usize) -> Option<usize> {
     t.by_res.get(&res).or_else(|| t.shadowed.get(&res)).map(|e| e.va)
 }
 
+/// lab (`XCL_PS_PROBE`): a texture kept in step: (the title's address, where its first byte is
+/// read from – 0: an unmapped page, not uploaded yet, written by the title's GPU work, its
+/// tiles unmapped, shadowed by a newer texture at its range).
+pub fn probe_state(res: usize) -> Option<(usize, usize, bool, bool, bool, bool)> {
+    let t = TEXTURES.lock().unwrap();
+    let (e, shadowed) = match t.by_res.get(&res) {
+        Some(e) => (e, false),
+        None => (t.shadowed.get(&res)?, true),
+    };
+    Some((e.va, e.src.first(), e.pending, e.gpu_written, e.unmapped, shadowed))
+}
+
 /// (texture, subresource or ALL_SUBRESOURCES, state after) of a transition the title recorded
 type Transition = (usize, u32, D3D12_RESOURCE_STATES);
 
@@ -727,12 +739,14 @@ pub fn submitted(lists: &[*mut c_void]) {
 /// textures their transitions name are mapped again and made pending, so this submit uploads
 /// them whole before the lists sample them.
 pub(super) fn revive_listed(lists: &[*mut c_void]) {
+    // lab: the evicted textures recorded draws named (`drawn`) come back with any submit
+    let drawn = std::mem::take(&mut *DRAWN.lock().unwrap());
     if !super::vram::any_evicted() {
         return;
     }
     let mut named: Vec<usize> = {
         let g = LIST_NOTES.lock().unwrap();
-        lists.iter().filter_map(|&l| g.get(&(l as usize))).flatten().map(|&(res, _, _)| res).filter(|&res| super::vram::is_evicted(res)).collect()
+        lists.iter().filter_map(|&l| g.get(&(l as usize))).flatten().map(|&(res, _, _)| res).chain(drawn).filter(|&res| super::vram::is_evicted(res)).collect()
     };
     if named.is_empty() {
         return;
@@ -740,6 +754,33 @@ pub(super) fn revive_listed(lists: &[*mut c_void]) {
     named.sort_unstable();
     named.dedup();
     revive_named(named);
+}
+
+/// lab: evicted textures a draw being recorded samples (`drawn`), until the next submit
+static DRAWN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static DRAWN_BACK: AtomicU64 = AtomicU64::new(0);
+
+/// lab (`bind::draw_textures`): a draw being recorded samples the textures `res` through T#s
+/// it indexes in the title's view heap itself – no transition and no CPU write says so, and
+/// with `XCL_SEEN_TOUCH=0` nothing else keeps them. They are recent for the page budget, and
+/// the evicted ones are mapped again and uploaded at the next submit (`revive_listed`).
+pub(super) fn drawn(res: &[usize]) {
+    if res.is_empty() || !super::vram::tracking() {
+        return;
+    }
+    super::vram::touch(res.iter().copied());
+    if !super::vram::any_evicted() {
+        return;
+    }
+    let back: Vec<usize> = res.iter().copied().filter(|&r| super::vram::is_evicted(r)).collect();
+    if back.is_empty() {
+        return;
+    }
+    let n = DRAWN_BACK.fetch_add(back.len() as u64, Ordering::Relaxed) + back.len() as u64;
+    if n.is_power_of_two() || (n - back.len() as u64).next_power_of_two() <= n {
+        crate::xlog_info!("page budget: {n} evicted textures named by draws so far (mapped again at the next submit)");
+    }
+    DRAWN.lock().unwrap().extend(back);
 }
 
 /// Page budget: the evicted textures `named` (sorted, no repeats) are mapped again and made
