@@ -555,6 +555,14 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
             list.Dispatch(groups, 1, 1);
             emit_uav_barrier(list, Some(&res_buf));
+            {
+                // lab: as above, for a direct two-pass DispatchMesh (kinds 8..11)
+                let (r, vd) = (res_buf.as_raw() as usize, tp.record.vert_dwords() as u64 * 4);
+                ei_peek(this, 8, groups, r, 0, 0, 0);
+                ei_peek(this, 9, groups, r, 16, r, 28);
+                ei_peek(this, 10, groups, r, 16 + vd, r, 28 + vd);
+                ei_peek(this, 11, groups, r, 16 + 2 * vd, r, 28 + 2 * vd);
+            }
             bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
             pc_dm(this, groups.saturating_mul(tp.mesh_groups_per_record), 1, 1);
             emit_uav_barrier(list, Some(&res_buf));
@@ -633,17 +641,19 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 None => (args, args_off),
             };
             ei_peek(this, 0, max, args, args_off + u64::from(msig.mesh_offset), count_buf, count_off);
-            if bounded.is_some() {
-                // lab: the clamp shader's own notes (kind 4: the record as it loaded it; 5: total, budget, x written; 6: records, kind, stride)
-                ei_peek(this, 4, max, args, 0x8000, 0, 0);
-                ei_peek(this, 5, max, args, 0x800C, 0, 0);
-                ei_peek(this, 6, max, args, 0x8018, 0, 0);
-            }
             let run = (|| -> Result<(), String> {
                 let (res_buf, res_va) = ensure_res_buffer(this, RES_BYTES)?;
                 bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
                 pc(this, msig.companion_dispatch, max, args, args_off, count_buf, count_off);
                 emit_uav_barrier(list, Some(&res_buf));
+                {
+                    // lab: record 0 as the compute pass left it (kind 4: vertices, primitives, spare; 5/6/7: position of vertex 0/1/2, w as the "count")
+                    let (r, vd) = (res_buf.as_raw() as usize, tp.record.vert_dwords() as u64 * 4);
+                    ei_peek(this, 4, max, r, 0, 0, 0);
+                    ei_peek(this, 5, max, r, 16, r, 28);
+                    ei_peek(this, 6, max, r, 16 + vd, r, 28 + vd);
+                    ei_peek(this, 7, max, r, 16 + 2 * vd, r, 28 + 2 * vd);
+                }
                 if tp.mesh_groups_per_record > 1 && max > 0 && args != 0 {
                     let scaled = make_scaled_args_buffer(this, list, args, args_off, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record)?;
                     bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
@@ -723,10 +733,6 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // the records bounded on the GPU first (a garbage record would hang it): this changes the
     // list's compute bindings, which `bind_abi` sets again
     let bounded = super::indirect_clamp::bound(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off);
-    if let (Some(b), false) = (&bounded, gfx) {
-        // lab: the control for the two-pass notes (kind 7: records, kind, stride of a compute call)
-        ei_peek(this, 7, max, b.raw(), 0x8018, 0, 0);
-    }
     match &bounded {
         Some(b) => ei_peek(this, if gfx { 1 } else { 2 }, max, b.raw(), 0, count_buf, count_off),
         None => ei_peek(this, if gfx { 1 } else { 2 }, max, args, args_off, count_buf, count_off),
@@ -775,9 +781,11 @@ unsafe fn ei_peek(this: *mut c_void, kind: u8, max: u32, args: usize, args_at: u
     }
     // every n-th call of a kind (`XCL_EI_PEEK_EVERY`, default 4)
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static CALLS: [AtomicU64; 8] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicU64 = AtomicU64::new(0);
+    static CALLS: [AtomicU64; 16] = [Z; 16];
     let every = *EVERY.get_or_init(|| std::env::var("XCL_EI_PEEK_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64).max(1));
-    if CALLS[kind as usize & 7].fetch_add(1, Ordering::Relaxed) % every != 0 {
+    if CALLS[kind as usize & 15].fetch_add(1, Ordering::Relaxed) % every != 0 {
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
@@ -865,11 +873,15 @@ fn ei_peek_report() {
             if !empty && !(has_count && c == 0) {
                 row.4 += x as u64 * if kind == 1 { y as u64 } else { y as u64 * z as u64 };
             }
-            if row.5.len() < 14 && (!empty || row.0 % 97 == 1 || kind >= 4) {
-                row.5.push(format!("max {max} [{x:#x} {y:#x} {z:#x}]{}", if has_count { format!(" count {c:#x}") } else { String::new() }));
+            if row.5.len() < if kind >= 4 { 48 } else { 10 } && (!empty || row.0 % 97 == 1 || kind >= 4) {
+                if matches!(kind, 5..=7 | 9..=11) {
+                    row.5.push(format!("({:.4e} {:.4e} {:.4e} {:.4e})", f32::from_bits(x), f32::from_bits(y), f32::from_bits(z), f32::from_bits(c)));
+                } else {
+                    row.5.push(format!("max {max} [{x:#x} {y:#x} {z:#x}]{}", if has_count { format!(" count {c:#x}") } else { String::new() }));
+                }
             }
         }
-        crate::xlog_info!("ei peek: {} calls sampled (kind 0 two-pass mesh bounded, 1 graphics, 2 compute, 3 two-pass mesh as the title wrote them)", pk.meta.len());
+        crate::xlog_info!("ei peek: {} calls sampled (kind 0 two-pass mesh bounded, 1 graphics, 2 compute, 3 two-pass mesh as the title wrote them; record 0 after the compute pass: 4 header + 5/6/7 positions (EI), 8 header + 9/10/11 positions (direct, max = groups))", pk.meta.len());
         for ((kind, t), (n, pending, empty, zero_count, work, examples)) in rows {
             crate::xlog_info!("ei peek: kind {kind} at {t}-{} s: {n} calls, {pending} not run yet, {empty} with empty arguments, {zero_count} with count 0, work of the rest {work}; {}", t + 4, examples.join("; "));
         }

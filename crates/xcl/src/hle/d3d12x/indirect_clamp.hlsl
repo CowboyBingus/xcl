@@ -86,12 +86,6 @@ void main(uint t : SV_GroupIndex) {
             }
             bounded.Store3(i * stride + action_at, a);
         }
-        // lab: what the first record read and decided, past the records (the copy is 64 KiB or more)
-        if (i == 0 && records * stride <= 0x8000) {
-            bounded.Store3(0x8000, source.Load3(source_at + action_at));
-            bounded.Store3(0x800C, uint3(total, budget, a.x));
-            bounded.Store3(0x8018, uint3(records, kind, stride));
-        }
         GroupMemoryBarrierWithGroupSync();
         if (t == THREADS - 1)
             carry = total;
