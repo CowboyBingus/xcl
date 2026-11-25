@@ -4008,7 +4008,45 @@ pub(super) unsafe fn depth_twin_flush(list: *mut c_void, res: usize, plane: u32)
     if n <= 12 || n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: depth twin flush #{n}: {res:#x} plane {plane}, {} subresources from {}, in state {:#x}", info.subs, info.first, states[0]);
     }
-    if info.staging != 0 {
+    if info.dsv != 0 {
+        // lab: twin → buffer → a full-screen pass that writes each texel as depth (the depth plane of
+        // a D24S8 buffer takes no copy), then the title's bindings again
+        let pass = device_of(list).and_then(|dev| super::depth_twin::depth_pass(&dev));
+        let st = info.staging as *mut c_void;
+        if let (Some((rs, pso)), Some(staging)) = (pass, ID3D12Resource::from_raw_borrowed(&st)) {
+            const PSR: u32 = 0x80;
+            const DEPTH_WRITE: u32 = 0x10;
+            let (d, s) = (placed(info.staging, D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, ..info.fp_twin }), sub_of(info.twin, 0));
+            copy(&d, &s);
+            std::mem::forget((d, s));
+            barrier(info.staging, ALL, COPY_DEST, PSR);
+            barrier(res, info.first, states[0], DEPTH_WRITE);
+            let (w, h) = (info.fp_twin.Footprint.Width, info.fp_twin.Footprint.Height);
+            let vp = D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: w as f32, Height: h as f32, MinDepth: 0.0, MaxDepth: 1.0 };
+            let sc = windows::Win32::Foundation::RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+            let pitch = info.fp_twin.Footprint.RowPitch;
+            pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, 30)(list, rs);
+            pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, pso);
+            pc::<unsafe extern "system" fn(*mut c_void, u32)>(list, PC_IA_SET_PRIMITIVE_TOPOLOGY)(list, 4);
+            pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_VIEWPORT)>(list, PC_RS_SET_VIEWPORTS)(list, 1, &vp);
+            pc::<unsafe extern "system" fn(*mut c_void, u32, *const windows::Win32::Foundation::RECT)>(list, PC_RS_SET_SCISSOR_RECTS)(list, 1, &sc);
+            pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize)>(list, PC_OM_SET_RENDER_TARGETS)(list, 0, std::ptr::null(), 0, &info.dsv);
+            pc::<unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32)>(list, 36)(list, 0, 1, &pitch, 0);
+            pc::<unsafe extern "system" fn(*mut c_void, u32, u64)>(list, 40)(list, 1, staging.GetGPUVirtualAddress());
+            pc::<unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32)>(list, 12)(list, 3, 1, 0, 0);
+            barrier(res, info.first, DEPTH_WRITE, states[0]);
+            barrier(info.staging, ALL, PSR, COPY_DEST);
+            // the title's state again: its bindings, its pipeline (a translated draw sets its root
+            // signature and arguments itself, `bind_abi`)
+            let kept = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).map(|s| (s.bindings.clone(), s.bound_pso));
+            if let Some((b, bound_pso)) = kept {
+                restore_bindings(list, &b, D3D12_COMMAND_LIST_TYPE_DIRECT);
+                if bound_pso != 0 {
+                    pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, super::pso_async::resolve_for_bind(bound_pso));
+                }
+            }
+        }
+    } else if info.staging != 0 {
         // twin → buffer → the plane (a stencil plane takes R8 data from a buffer)
         let (d, s) = (placed(info.staging, D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, ..info.fp_twin }), sub_of(info.twin, 0));
         copy(&d, &s);
@@ -4030,6 +4068,43 @@ pub(super) unsafe fn depth_twin_flush(list: *mut c_void, res: usize, plane: u32)
         }
     }
     barrier(info.twin, ALL, COPY_SOURCE, UA);
+}
+
+/// lab (`depth_twin`): the depth buffer's plane into its twin before a compute dispatch that names
+/// the twin (`Info::copy_in`: the depth of a D32S8 buffer, of which a pass may write only a part).
+pub(super) unsafe fn depth_twin_fill(list: *mut c_void, res: usize, plane: u32) {
+    if plane == 2 {
+        return;
+    }
+    let Some(info) = super::depth_twin::info(res, plane).filter(|i| i.copy_in && i.staging != 0) else { return };
+    if tracked_list_type(list).is_some_and(|t| t != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        return;
+    }
+    let barrier = |r: usize, sub: u32, before: u32, after: u32| {
+        if before != after {
+            let b: [u32; 8] = [0, 0, r as u32, (r as u64 >> 32) as u32, sub, before, after, 0];
+            pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, PC_RESOURCE_BARRIER)(list, 1, &b);
+        }
+    };
+    let copy = |d: &D3D12_TEXTURE_COPY_LOCATION, s: &D3D12_TEXTURE_COPY_LOCATION| {
+        pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION)(list, d, 0, 0, 0, s, std::ptr::null());
+    };
+    let sub_of = |r: usize, k: u32| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k } };
+    let placed = |r: usize, fp: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+    const ALL: u32 = u32::MAX;
+    let state = super::depth_twin::state(res, info.first);
+    barrier(res, info.first, state, 0x800);
+    let (d, s) = (placed(info.staging, D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, ..info.fp_plane }), sub_of(res, info.first));
+    copy(&d, &s);
+    std::mem::forget((d, s));
+    barrier(res, info.first, 0x800, state);
+    barrier(info.staging, ALL, 0x400, 0x800);
+    barrier(info.twin, ALL, 0x8, 0x400);
+    let (d, s) = (sub_of(info.twin, 0), placed(info.staging, D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, ..info.fp_twin }));
+    copy(&d, &s);
+    std::mem::forget((d, s));
+    barrier(info.twin, ALL, 0x400, 0x8);
+    barrier(info.staging, ALL, 0x800, 0x400);
 }
 
 /// lab (`depth_twin`, alias pairs): the R32_UINT UAV texture `res` into the R9G9B9E5 texture the

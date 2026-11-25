@@ -2365,9 +2365,11 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     let null_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D, ..Default::default() };
     // lab: such a depth buffer's UAVs are of its twin (`depth_twin`)
     let twin = if no_uav { super::depth_twin::get_or_make(res, desc.as_ref().map_or(0, |v| v.Format.0)) } else { None };
+    // (lab: the twin of the depth of a two-plane buffer: views in the twin's format)
+    let twin_plane0_format = twin.filter(|t| t.1 == 0).and_then(|_| ID3D12Resource::from_raw_borrowed(&res).and_then(|r| super::depth_twin::plane0_view_format(r.GetDesc().Format.0)));
     // (a stencil twin is R8_UINT: the view in its format)
     let twin_desc = desc.as_ref().map(|v| {
-        let mut t = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: if matches!(twin, Some((_, 1))) { windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UINT } else { v.Format }, ..*v };
+        let mut t = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: if matches!(twin, Some((_, 1))) { windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UINT } else { twin_plane0_format.unwrap_or(v.Format) }, ..*v };
         // (the twin has one plane)
         if t.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D {
             t.Anonymous.Texture2D.PlaneSlice = 0;
@@ -2441,7 +2443,9 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 } },
         };
-        if let Some(v) = pc_srv(&rd, Some(&srv)) {
+        if let Some(f) = twin_plane0_format {
+            srv.Format = f;
+        } else if let Some(v) = pc_srv(&rd, Some(&srv)) {
             srv = v;
         }
         let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));

@@ -857,6 +857,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         rt_dump_note_compute(this);
     }
     let twins = if compute && !gfx { depth_twins_named(this) } else { Vec::new() };
+    for &(res, plane) in &twins {
+        super::list_x::depth_twin_fill(this, res, plane);
+    }
     let result = bind_abi(this, list, pso, gfx);
     if let Ok(()) = result {
         ei_work(this, sig, super::targets::RAN);
@@ -2250,6 +2253,9 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     dispatch_probe(this, pso, [x, y, z]);
     rt_dump_note_compute(this);
     let twins = depth_twins_named(this);
+    for &(res, plane) in &twins {
+        super::list_x::depth_twin_fill(this, res, plane);
+    }
     bind_abi(this, list, pso, false)?;
     list.Dispatch(x, y, z);
     for (res, plane) in twins {

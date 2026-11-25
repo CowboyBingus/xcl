@@ -29,11 +29,18 @@ pub struct Info {
     pub first: u32,
     pub fp_twin: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     pub fp_plane: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    /// lab: the depth plane of a console D16S8 buffer (R24G8 on the PC; an R16_UNORM twin): a DSV
+    /// of the depth buffer for the pass that writes the twin's values as depth (0: no such pass)
+    pub dsv: usize,
+    /// lab: the plane is copied into the twin before a dispatch that names it (the depth of a
+    /// D32S8 buffer: a pass may write only some texels)
+    pub copy_in: bool,
 }
 
 struct Twin {
     _res: ID3D12Resource,
     _staging: Option<ID3D12Resource>,
+    _dsv_heap: Option<ID3D12DescriptorHeap>,
     shape: (u64, u32, u16, u16, i32),
     info: Info,
 }
@@ -55,6 +62,84 @@ fn mode() -> u8 {
         Ok("s") => 1,
         _ => 2,
     })
+}
+
+/// lab: twins of the depth plane of two-plane buffers. `XCL_DEPTH_TWIN_PLANE0`: bit 0 (1) the
+/// console's D16S8 (R24G8), bit 1 (2) D32S8 (R32G8X24); default 1.
+fn plane0_on(bit: u32) -> bool {
+    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| std::env::var("XCL_DEPTH_TWIN_PLANE0").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1)) & bit != 0
+}
+
+/// The format of views of the twin of plane 0 of a depth buffer in `format` (None: the title's).
+pub fn plane0_view_format(format: i32) -> Option<DXGI_FORMAT> {
+    match format {
+        44 => Some(DXGI_FORMAT_R16_UNORM),
+        19 => Some(DXGI_FORMAT_R32_FLOAT),
+        _ => None,
+    }
+}
+
+/// lab: (root signature, pipeline) of the pass that writes an R16_UNORM twin's texels (in a buffer:
+/// rows of `pitch` bytes) as the depth of a D24S8 buffer; the stencil is not touched.
+pub unsafe fn depth_pass(dev: &ID3D12Device) -> Option<(usize, usize)> {
+    static P: Mutex<Option<Option<(usize, usize)>>> = Mutex::new(None);
+    let mut g = P.lock().unwrap();
+    if let Some(p) = *g {
+        return p;
+    }
+    let made = (|| -> Result<(usize, usize), String> {
+        let vs = crate::gpu::recomp::dxc::compile_cached("float4 main(uint id : SV_VertexID) : SV_Position { return float4(id == 2u ? 3.0 : -1.0, id == 1u ? 3.0 : -1.0, 0.0, 1.0); }\n", "main", "vs_6_0")?.0;
+        let ps = crate::gpu::recomp::dxc::compile_cached(
+            "ByteAddressBuffer src : register(t0);\ncbuffer C : register(b0) { uint pitch; };\nfloat main(float4 pos : SV_Position) : SV_Depth {\n    uint2 p = uint2(pos.xy);\n    uint at = p.y * pitch + p.x * 2u;\n    uint w = src.Load(at & ~3u);\n    uint q = (w >> ((at & 2u) * 8u)) & 0xFFFFu;\n    return (float)q / 65535.0;\n}\n",
+            "main",
+            "ps_6_0",
+        )?
+        .0;
+        let params = [
+            D3D12_ROOT_PARAMETER { ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, Anonymous: D3D12_ROOT_PARAMETER_0 { Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 1 } }, ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL },
+            D3D12_ROOT_PARAMETER { ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV, Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 } }, ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL },
+        ];
+        let desc = D3D12_ROOT_SIGNATURE_DESC { NumParameters: params.len() as u32, pParameters: params.as_ptr(), ..Default::default() };
+        let mut blob = None;
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).map_err(|e| format!("root signature: {e}"))?;
+        let blob = blob.ok_or("root signature blob")?;
+        let dev_raw = dev.as_raw();
+        let create_rs: unsafe extern "system" fn(*mut c_void, u32, *const c_void, usize, *const windows::core::GUID, *mut *mut c_void) -> i32 = std::mem::transmute(super::real::orig_fn(dev_raw, 16));
+        let mut rs_raw = std::ptr::null_mut();
+        let hr = create_rs(dev_raw, 0, blob.GetBufferPointer(), blob.GetBufferSize(), &ID3D12RootSignature::IID, &mut rs_raw);
+        if hr < 0 || rs_raw.is_null() {
+            return Err(format!("CreateRootSignature {:#x}", hr as u32));
+        }
+        let rs = ID3D12RootSignature::from_raw(rs_raw);
+        let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+            VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as *const c_void, BytecodeLength: vs.len() },
+            PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as *const c_void, BytecodeLength: ps.len() },
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: false.into(), ..Default::default() },
+            DepthStencilState: D3D12_DEPTH_STENCIL_DESC { DepthEnable: true.into(), DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL, DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS, StencilEnable: false.into(), ..Default::default() },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 0,
+            DSVFormat: DXGI_FORMAT_D24_UNORM_S8_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let create_pso: unsafe extern "system" fn(*mut c_void, *const D3D12_GRAPHICS_PIPELINE_STATE_DESC, *const windows::core::GUID, *mut *mut c_void) -> i32 = std::mem::transmute(super::real::orig_fn(dev_raw, 10));
+        let mut pso_raw = std::ptr::null_mut();
+        let hr = create_pso(dev_raw, &pd, &ID3D12PipelineState::IID, &mut pso_raw);
+        std::mem::ManuallyDrop::drop(&mut pd.pRootSignature);
+        if hr < 0 || pso_raw.is_null() {
+            return Err(format!("CreateGraphicsPipelineState {:#x}", hr as u32));
+        }
+        // (kept for the life of the process)
+        Ok((rs.into_raw() as usize, pso_raw as usize))
+    })();
+    if let Err(e) = &made {
+        crate::xlog_warn!("D3D12.X: depth twin: no depth-write pass: {e}");
+    }
+    *g = Some(made.ok());
+    g.unwrap()
 }
 
 fn shape(d: &D3D12_RESOURCE_DESC) -> (u64, u32, u16, u16, i32) {
@@ -82,6 +167,11 @@ pub unsafe fn get_or_make(res: *mut c_void, view_format: i32) -> Option<(*mut c_
     let (plane, twin_format) = match (d.Format.0, view_format) {
         (39 | 53, _) if mode() == 2 => (0u32, d.Format),
         (44, 47) | (19, 22) if d.DepthOrArraySize == 1 && d.MipLevels == 1 => (1, DXGI_FORMAT_R8_UINT),
+        // lab: the depth of a two-plane buffer. R24G8 (the console's D16S8: a retail title's material
+        // permutation, z = n / 65535, which its tile-lighting draws EQUAL-test): an R16_UNORM twin,
+        // written into the depth plane by a full-screen pass. R32G8X24: an R32_FLOAT twin, through a buffer.
+        (44, 46) if mode() == 2 && plane0_on(1) && d.DepthOrArraySize == 1 && d.MipLevels == 1 => (0, DXGI_FORMAT_R16_UNORM),
+        (19, 21) if mode() == 2 && plane0_on(2) && d.DepthOrArraySize == 1 && d.MipLevels == 1 => (0, DXGI_FORMAT_R32_FLOAT),
         _ => return None,
     };
     let mut g = TWINS.lock().unwrap();
@@ -108,14 +198,15 @@ pub unsafe fn get_or_make(res: *mut c_void, view_format: i32) -> Option<(*mut c_
     dev.GetCopyableFootprints(&td, 0, 1, 0, Some(&mut fp_twin), None, None, Some(&mut total_twin));
     dev.GetCopyableFootprints(&d, first, 1, 0, Some(&mut fp_plane), None, None, Some(&mut total_plane));
     let mut staging: Option<ID3D12Resource> = None;
-    if plane == 1 {
-        if fp_twin.Footprint.RowPitch != fp_plane.Footprint.RowPitch || total_plane == 0 {
+    let pass = plane == 0 && d.Format.0 == 44;
+    if plane == 1 || twin_format != d.Format {
+        if !pass && (fp_twin.Footprint.RowPitch != fp_plane.Footprint.RowPitch || total_plane == 0) {
             crate::xlog_warn!("D3D12.X: depth twin: stencil footprints differ ({:?} / {:?})", fp_twin.Footprint, fp_plane.Footprint);
             return None;
         }
         let bd = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: total_twin.max(total_plane),
+            Width: total_twin.max(total_plane).max(256),
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -129,15 +220,34 @@ pub unsafe fn get_or_make(res: *mut c_void, view_format: i32) -> Option<(*mut c_
             return None;
         }
     }
+    // lab: the DSV of the depth-write pass
+    let mut dsv_heap: Option<ID3D12DescriptorHeap> = None;
+    let mut dsv = 0usize;
+    if pass {
+        let dev_raw = dev.as_raw();
+        let hd = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV, NumDescriptors: 1, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE, NodeMask: 0 };
+        let create_heap: unsafe extern "system" fn(*mut c_void, *const D3D12_DESCRIPTOR_HEAP_DESC, *const windows::core::GUID, *mut *mut c_void) -> i32 = std::mem::transmute(super::real::orig_fn(dev_raw, 14));
+        let create_dsv: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_DEPTH_STENCIL_VIEW_DESC, usize) = std::mem::transmute(super::real::orig_fn(dev_raw, 21));
+        let mut raw = std::ptr::null_mut();
+        if create_heap(dev_raw, &hd, &ID3D12DescriptorHeap::IID, &mut raw) < 0 || raw.is_null() {
+            crate::xlog_warn!("D3D12.X: depth twin: no DSV heap");
+            return None;
+        }
+        let heap = ID3D12DescriptorHeap::from_raw(raw);
+        dsv = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+        let vd = D3D12_DEPTH_STENCIL_VIEW_DESC { Format: DXGI_FORMAT_D24_UNORM_S8_UINT, ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D, Flags: D3D12_DSV_FLAG_NONE, ..Default::default() };
+        create_dsv(dev_raw, res, &vd, dsv);
+        dsv_heap = Some(heap);
+    }
     let texel = match twin_format.0 {
-        39 => 4,
-        53 => 2,
+        39 | 41 => 4,
+        53 | 56 => 2,
         _ => 1,
     };
     let bytes = d.Width * d.Height as u64 * subs as u64 * texel;
     let total = BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
-    let info = Info { twin: twin.as_raw() as usize, staging: staging.as_ref().map_or(0, |s| s.as_raw() as usize), subs, first, fp_twin, fp_plane };
-    m.insert((res as usize, plane), Twin { _res: twin, _staging: staging, shape: shape(&d), info });
+    let info = Info { twin: twin.as_raw() as usize, staging: staging.as_ref().map_or(0, |s| s.as_raw() as usize), subs, first, fp_twin, fp_plane, dsv, copy_in: plane == 0 && d.Format.0 == 19 };
+    m.insert((res as usize, plane), Twin { _res: twin, _staging: staging, _dsv_heap: dsv_heap, shape: shape(&d), info });
     ANY.store(true, Ordering::Relaxed);
     if m.len() <= 8 || m.len().is_power_of_two() || plane == 1 {
         crate::xlog_info!(
