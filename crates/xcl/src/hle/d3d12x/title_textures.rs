@@ -63,7 +63,7 @@ impl Source {
                 for &(r_off, r_len, at) in runs.iter() {
                     let (s, e) = (r_off.max(off), (r_off + r_len).min(off + len));
                     if at != 0 && s < e {
-                        out[s - off..e - off].copy_from_slice(&title_bytes(at + (s - r_off), e - s));
+                        read_title_into(at + (s - r_off), &mut out[s - off..e - off]);
                     }
                 }
                 std::borrow::Cow::Owned(out)
@@ -78,6 +78,12 @@ impl Source {
             Source::Pages(runs) => (None, runs),
         };
         at.map(|a| (a, a + size)).into_iter().chain(runs.iter().filter(|r| r.2 != 0).map(|&(_, n, a)| (a, a + n)))
+    }
+
+    /// Whether some of the memory its `size` bytes are read from is committed and readable (the
+    /// first page of each range is asked): not when the title decommitted all of it.
+    fn committed(&self, size: usize) -> bool {
+        self.ranges(size).any(|(s, e)| s < e && crate::gpu::shader::readable(s, e.min((s | 0xFFF) + 1) - s))
     }
 
     /// Whether a page of `dirty` (sorted, `page` bytes each) holds some of its `size` bytes.
@@ -851,13 +857,12 @@ fn table_look_due(last: &mut std::collections::HashMap<usize, std::time::Instant
 /// one) is its shared-heap index, which `resolve` turns into a texture. Buffer V#s, empty slots
 /// and memory that cannot be read name none; no repeats.
 fn table_textures(at: usize, slots: usize, resolve: impl Fn(u32) -> Option<usize>) -> Vec<usize> {
-    let n = slots * 8;
-    if !crate::gpu::shader::readable(at, 4 * n) {
-        return Vec::new();
-    }
+    // a copy: the title may decommit the table while it is read (what cannot be read is zeros)
+    let mut table = vec![0u8; 32 * slots];
+    unsafe { read_title_into(at, &mut table) };
     let mut out = Vec::new();
     for k in 0..slots {
-        let w = |i: usize| unsafe { ((at + 32 * k + 4 * i) as *const u32).read_unaligned() };
+        let w = |i: usize| u32::from_le_bytes(table[32 * k + 4 * i..32 * k + 4 * i + 4].try_into().unwrap());
         let (w0, w3) = (w(0), w(3));
         if w3 >> 28 < 8 || w0 == 0 {
             continue;
@@ -873,57 +878,48 @@ fn table_textures(at: usize, slots: usize, resolve: impl Fn(u32) -> Option<usize
 
 /// Page budget: the evicted textures `named` (sorted, no repeats) are mapped again and made
 /// pending, to be uploaded whole at the next look. One released meanwhile is left alone; one
-/// that cannot be mapped now stays evicted, for its next use to try again.
-fn revive_named(mut named: Vec<usize>) {
+/// that cannot be mapped now, or whose memory the title decommitted (`Source::committed`: it
+/// would read as zeros), stays evicted, for its next use or a CPU write to try again.
+fn revive_named(named: Vec<usize>) {
     if named.is_empty() {
         return;
     }
-    // lab: [named, not kept in step, not mapped again, mapped again but GPU-written (not uploaded), no entry]
-    static LAB: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-    let asked = named.len();
-    // a reference each while they are mapped (taken under the lock `forget` takes)
-    let live = {
+    // a reference each while they are mapped (taken under the lock `forget` takes), and where
+    // its bytes are read from
+    let live: Vec<(ID3D12Resource, Source, usize)> = {
         let t = TEXTURES.lock().unwrap();
-        named.retain(|res| t.by_res.contains_key(res) || t.shadowed.contains_key(res));
-        unsafe { clone_resources(&named) }
+        named
+            .iter()
+            .filter_map(|&res| {
+                let e = t.by_res.get(&res).or_else(|| t.shadowed.get(&res))?;
+                let p = res as *mut c_void;
+                unsafe { ID3D12Resource::from_raw_borrowed(&p) }.map(|r| (r.clone(), e.src.clone(), e.tex.size() as usize))
+            })
+            .collect()
     };
-    let revived: Vec<usize> = live.iter().filter(|r| unsafe { super::vram::revive(r) }).map(|r| r.as_raw() as usize).collect();
-    LAB[0].fetch_add(asked as u64, Ordering::Relaxed);
-    LAB[1].fetch_add((asked - named.len()) as u64, Ordering::Relaxed);
-    LAB[2].fetch_add((live.len() - revived.len()) as u64, Ordering::Relaxed);
-    let (mut written, mut gone) = (0u64, 0u64);
-    if !revived.is_empty() {
-        for &res in &revived {
-            forget_content(res);
-        }
-        let mut t = TEXTURES.lock().unwrap();
-        for &res in &revived {
-            match t.get_mut(res) {
-                Some(e) => {
-                    if e.gpu_written {
-                        written += 1;
-                    }
-                    if !e.pending && !e.gpu_written {
-                        e.pending = true;
-                        PENDING.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                None => gone += 1,
-            }
+    let (live, gone): (Vec<_>, Vec<_>) = live.into_iter().partition(|(_, src, size)| src.committed(*size));
+    if !gone.is_empty() {
+        static GONE: AtomicU64 = AtomicU64::new(0);
+        let k = gone.len() as u64;
+        let n = GONE.fetch_add(k, Ordering::Relaxed) + k;
+        if n.is_power_of_two() || (n - k).next_power_of_two() <= n {
+            crate::xlog_info!("page budget: {n} evicted textures left evicted so far – the title decommitted their memory");
         }
     }
-    LAB[3].fetch_add(written, Ordering::Relaxed);
-    LAB[4].fetch_add(gone, Ordering::Relaxed);
-    let bad = asked - revived.len() + written as usize + gone as usize;
-    if bad > 0 {
-        static SAID: AtomicU64 = AtomicU64::new(0);
-        let n = SAID.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 4 || n.is_power_of_two() {
-            let c: Vec<u64> = LAB.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-            crate::xlog_info!(
-                "lab: page budget revive #{n}: of {} evicted textures named so far {} are not kept in step, {} could not be mapped again, {} came back GPU-written (not uploaded), {} have no entry",
-                c[0], c[1], c[2], c[3], c[4]
-            );
+    let revived: Vec<usize> = live.iter().filter(|(r, _, _)| unsafe { super::vram::revive(r) }).map(|(r, _, _)| r.as_raw() as usize).collect();
+    if revived.is_empty() {
+        return;
+    }
+    for &res in &revived {
+        forget_content(res);
+    }
+    let mut t = TEXTURES.lock().unwrap();
+    for res in revived {
+        if let Some(e) = t.get_mut(res) {
+            if !e.pending && !e.gpu_written {
+                e.pending = true;
+                PENDING.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -1455,15 +1451,23 @@ pub(super) unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize)
 
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
 /// has only some of its pages mapped).
+#[cfg(test)]
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut out = vec![0u8; len];
-    let Some(limit) = at.checked_add(len) else { return out };
+    read_committed_into(at, &mut out);
+    out
+}
+
+/// `read_committed` into `out` (zeroed).
+unsafe fn read_committed_into(at: usize, out: &mut [u8]) {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let len = out.len();
+    let Some(limit) = at.checked_add(len) else { return };
     // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
     // walking it)
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
-        return out;
+        return;
     }
     let mut p = at;
     while p < limit {
@@ -1481,7 +1485,25 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
         }
         p = end;
     }
-    out
+}
+
+/// The title's `dst.len()` bytes at `at` copied into `dst` (zeroed). A committed coherent window
+/// stays committed and is copied directly; elsewhere the title may decommit pages while they
+/// are read (a revived texture's pages went away under its upload: 0xc0000005 in the memcpy),
+/// so a readable range is copied with one `ReadProcessMemory` (`copy_committed_region`), and
+/// what is not readable, or goes away meanwhile, stays zero.
+unsafe fn read_title_into(at: usize, dst: &mut [u8]) {
+    let len = dst.len();
+    if len == 0 {
+        return;
+    }
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
+        std::ptr::copy_nonoverlapping(at as *const u8, dst.as_mut_ptr(), len);
+    } else if crate::gpu::shader::readable(at, len) {
+        copy_committed_region(at, dst.as_mut_ptr(), len);
+    } else {
+        read_committed_into(at, dst);
+    }
 }
 
 /// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
@@ -1528,13 +1550,16 @@ unsafe fn subresources_on(picked: &[(&Source, &xg::Texture)], threads: usize) ->
     out
 }
 
-/// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
-/// as much as the detile of a video frame), else read page run by page run.
+/// The title's bytes at `at`: where they are in a committed coherent window, which stays
+/// committed (a copy first cost as much as the detile of a video frame), else a copy
+/// (`read_title_into`: pages the title decommits meanwhile read as zeros, not a fault).
 unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
-    if crate::gpu::shader::readable(at, len) {
+    if len > 0 && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
     } else {
-        std::borrow::Cow::Owned(read_committed(at, len))
+        let mut out = vec![0u8; len];
+        read_title_into(at, &mut out);
+        std::borrow::Cow::Owned(out)
     }
 }
 
@@ -1656,6 +1681,11 @@ mod tests {
             let pc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
             let console = console_desc(3, 512, 512, 1, 1, DXGI_FORMAT_R8_UNORM.0 as u32, 1);
             let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            // the title's memory of the sampled texture is committed (over decommitted memory it
+            // would not be mapped again)
+            use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+            let mem = VirtualAlloc(0x63_0000_0000usize as *const c_void, 512 * 512, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert_eq!(mem as usize, 0x63_0000_0000);
             let place_at = |va: usize| {
                 let mut p = std::ptr::null_mut();
                 let hr = super::super::vram::place_pages(dev, va, &pc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(512 * 512), riid, &mut p);
@@ -1665,6 +1695,7 @@ mod tests {
                 Some(ID3D12Resource::from_raw(p))
             };
             let (Some(sampled), Some(copied)) = (place_at(0x63_0000_0000), place_at(0x63_1000_0000)) else {
+                VirtualFree(mem, 0, MEM_RELEASE);
                 crate::gpu::recomp::runner::skip_test("no reserved textures");
                 return;
             };
@@ -1703,6 +1734,7 @@ mod tests {
             forget(a);
             forget(b);
             drop((sampled, copied));
+            VirtualFree(mem, 0, MEM_RELEASE);
         }
     }
 
@@ -2074,10 +2106,11 @@ mod tests {
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
     }
 
-    /// The title's bytes are used where they are when all of them are readable, and read with the
-    /// pages that are not committed as zeros otherwise – the same bytes either way.
+    /// Outside the committed coherent windows the title's bytes are copied (the title may
+    /// decommit them while they are read), the pages that are not committed as zeros – the same
+    /// bytes as `read_committed` either way.
     #[test]
-    fn title_bytes_are_used_in_place_when_all_are_readable() {
+    fn title_bytes_are_copied_outside_the_committed_windows() {
         use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
         unsafe {
             let base = VirtualAlloc(std::ptr::null(), 3 << 12, MEM_RESERVE, PAGE_READWRITE) as usize;
@@ -2087,8 +2120,7 @@ mod tests {
                 std::ptr::write_bytes((base + (page << 12)) as *mut u8, 0xA0 + page as u8, 1 << 12);
             }
             let whole = title_bytes(base, 1 << 12);
-            assert!(matches!(whole, std::borrow::Cow::Borrowed(_)), "a committed page is not copied");
-            assert_eq!(whole.as_ptr() as usize, base);
+            assert!(matches!(whole, std::borrow::Cow::Owned(_)), "a committed page outside the windows is copied");
             assert!(whole.iter().all(|&b| b == 0xA0));
             let holed = title_bytes(base, 3 << 12);
             assert!(matches!(holed, std::borrow::Cow::Owned(_)), "a range with a reserved page is read");
@@ -2622,6 +2654,152 @@ mod tests {
 
             stop.store(true, Ordering::Relaxed);
             mutator.join().unwrap();
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A texture over memory the title decommits (VirtualFree MEM_DECOMMIT) – before its upload,
+    /// or while it is read for one – is read with those pages as zeros, never a fault (a revived
+    /// texture's upload faulted in its memcpy); the pages still committed are read, a descriptor
+    /// table's too. A source all decommitted is not `committed` (not mapped again).
+    #[test]
+    fn a_texture_over_memory_the_title_decommits_reads_as_zeros_without_a_fault() {
+        use std::sync::atomic::AtomicBool;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const PAGE: usize = 0x1000;
+        // 256 x 256 RGBA8, one level: 64 pages
+        let tex = xg::Texture::new(&console_desc(3, 256, 256, 1, 1, 28, 0x105)).unwrap();
+        let size = tex.size() as usize;
+        let pages = size / PAGE;
+        assert!(pages >= 16);
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            std::ptr::write_bytes(base as *mut u8, 0x5A, size);
+            let at = Source::At(base);
+            // the same memory in two runs, as a page-mapped GPU view reads it
+            let half = size / 2;
+            let runs = Source::Pages(vec![(0, half, base), (half, size - half, base + half)].into());
+            assert!(at.committed(size) && runs.committed(size));
+
+            // decommitted before the upload: zeros, and not mapped again
+            assert_ne!(VirtualFree(base as *mut c_void, size, MEM_DECOMMIT), 0);
+            assert!(!at.committed(size) && !runs.committed(size), "a decommitted texture is not mapped again");
+            for src in [&at, &runs] {
+                assert!(src.bytes(0, size).iter().all(|&b| b == 0));
+                assert!(subresources_of(src, &tex).iter().all(|s| s.data.iter().all(|&b| b == 0)));
+            }
+            assert!(table_textures(base, 16, |_| Some(1)).is_empty(), "a decommitted table names nothing");
+
+            // decommitted and committed again while it is read: the first and last pages stay
+            assert_ne!(VirtualAlloc(base as *const c_void, size, MEM_COMMIT, PAGE_READWRITE), std::ptr::null_mut());
+            std::ptr::write_bytes(base as *mut u8, 0x5A, PAGE);
+            std::ptr::write_bytes((base + size - PAGE) as *mut u8, 0xA5, PAGE);
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_w = Arc::clone(&stop);
+            let mutator = std::thread::spawn(move || {
+                let mut i = 0usize;
+                while !stop_w.load(Ordering::Relaxed) {
+                    let p = (base + (1 + i % (pages - 2)) * PAGE) as *mut c_void;
+                    let _ = VirtualFree(p, PAGE, MEM_DECOMMIT);
+                    if !VirtualAlloc(p, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() {
+                        std::ptr::write_bytes(p as *mut u8, 0x3C, PAGE);
+                    }
+                    i = i.wrapping_add(1);
+                }
+            });
+            for _ in 0..400 {
+                for src in [&at, &runs] {
+                    let b = src.bytes(0, size);
+                    assert!(b[..PAGE].iter().all(|&x| x == 0x5A) && b[size - PAGE..].iter().all(|&x| x == 0xA5));
+                    assert_eq!(subresources_of(src, &tex).len(), 1);
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            mutator.join().unwrap();
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Page budget: an evicted texture whose memory the title decommitted is not mapped again
+    /// for a list that names it (it would upload zeros), one over committed memory is; reading
+    /// the first for an upload and uploading the second do not fault.
+    #[test]
+    fn page_budget_a_texture_over_decommitted_memory_is_not_mapped_again() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let dev = super::super::real::device_raw();
+            // 512 x 512 R8: 4 tiles, the smallest texture the budget evicts
+            let pc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let console = console_desc(3, 512, 512, 1, 1, DXGI_FORMAT_R8_UNORM.0 as u32, 1);
+            let size = 512 * 512;
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            // the title's memory of both textures, committed
+            let base = VirtualAlloc(std::ptr::null(), 2 * size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            std::ptr::write_bytes(base as *mut u8, 0x77, 2 * size);
+            let place_at = |va: usize| {
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::vram::place_pages(dev, va, &pc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(size as u64), riid, &mut p);
+                if !hr.is_some_and(|hr| hr >= 0) || p.is_null() {
+                    return None;
+                }
+                Some(ID3D12Resource::from_raw(p))
+            };
+            let (Some(gone), Some(kept)) = (place_at(base), place_at(base + size)) else {
+                VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+                crate::gpu::recomp::runner::skip_test("no reserved textures");
+                return;
+            };
+            let (a, b) = (gone.as_raw() as usize, kept.as_raw() as usize);
+            register(dev, gone.as_raw(), base, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            register(dev, kept.as_raw(), base + size, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            {
+                // both uploaded once already
+                let mut t = TEXTURES.lock().unwrap();
+                for r in [a, b] {
+                    let e = t.get_mut(r).unwrap();
+                    if e.pending {
+                        e.pending = false;
+                        PENDING.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            assert!(super::super::vram::evict_for_test(a) && super::super::vram::evict_for_test(b));
+            assert_ne!(VirtualFree(base as *mut c_void, size, MEM_DECOMMIT), 0);
+
+            let list = 0x7E57_0DECusize;
+            LIST_NOTES.lock().unwrap().entry(list).or_default().extend([a, b].map(|r| (r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)));
+            revive_listed(&[list as *mut c_void]);
+            assert!(super::super::vram::is_evicted(a), "a texture over decommitted memory stays evicted");
+            assert!(!TEXTURES.lock().unwrap().get_mut(a).unwrap().pending);
+            assert!(!super::super::vram::is_evicted(b), "a texture over committed memory is mapped again");
+
+            // the upload of the one mapped again, and a read of the other's memory
+            let upload = |r: &ID3D12Resource| {
+                let mut t = TEXTURES.lock().unwrap();
+                let e = t.get_mut(r.as_raw() as usize).unwrap();
+                (r.clone(), (e.device, e.src.clone(), Arc::clone(&e.tex), e.states.clone()))
+            };
+            let (_, (_, src_a, tex_a, _)) = upload(&gone);
+            assert!(subresources_of(&src_a, &tex_a).iter().all(|s| s.data.iter().all(|&x| x == 0)));
+            let before = UPLOADS.load(Ordering::Relaxed);
+            upload_all(vec![upload(&kept)]);
+            assert_eq!(UPLOADS.load(Ordering::Relaxed), before + 1, "the texture over committed memory is uploaded");
+
+            // nothing left evicted for the tests after this one
+            assert!(super::super::vram::revive(&gone));
+            list_reset(list);
+            forget(a);
+            forget(b);
+            drop((gone, kept));
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
     }
