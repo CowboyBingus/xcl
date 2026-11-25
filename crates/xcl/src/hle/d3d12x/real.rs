@@ -1247,6 +1247,14 @@ static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
 fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
     let Some((at, bytes)) = console_buffer(res) else {
         note_buffer_view();
+        // lab: which buffers (the shader reads nothing through such a view)
+        static N: AtomicU64 = AtomicU64::new(0);
+        let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if k <= 60 || k.is_power_of_two() {
+            let r = res as *mut c_void;
+            let d = unsafe { ID3D12Resource::from_raw_borrowed(&r).map(|x| x.GetDesc()) };
+            crate::xlog_info!("lab: empty V# #{k}: buffer {res:#x} {:?} at title address {:x?}, view format {} first {first} n {n} stride {stride} raw {raw} at {:.1} s", d.map(|d| (d.Width, d.Flags.0)), TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()), format.0, crate::log::uptime());
+        }
         return [0; 4];
     };
     let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
@@ -1379,6 +1387,67 @@ unsafe fn place_console_buffer_sparse(this: *mut c_void, d: &D3D12_RESOURCE_DESC
     }
     super::sparse::free(p);
     None
+}
+
+/// lab: title address ranges of buffers placed outside the unified windows that live in the
+/// sparse windows instead: (title address, bytes, address in the windows)
+static OUTSIDE_BUFFERS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+
+/// lab: a buffer the title places (CreatePlacedResourceX) at an address outside every memory
+/// window (a retail title: all its compute buffers - light lists, ray lists, BVH data - in plain
+/// reservations above its two 24 GB views, 0x15_0000_0000 and up, past the 16 windows the
+/// translated shaders can address). As a separate committed resource its V# was empty: the
+/// shaders read zeros and their writes were dropped. Here it gets video memory at an address of the
+/// sparse windows (no CPU pages): its V# names that address. `XCL_OUTSIDE_BUFFERS=1`: on (off by default: w58).
+pub(super) unsafe fn place_outside_buffer(this: *mut c_void, va: usize, desc: &[u8; 0x38], state: u32, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_OUTSIDE_BUFFERS").is_ok_and(|v| v.trim() == "1")) {
+        return None;
+    }
+    let u = crate::gpu::uma::get()?;
+    if !u.has_sparse() {
+        return None;
+    }
+    let d: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(desc.as_ptr() as *const D3D12_RESOURCE_DESC);
+    let bytes = d.Width as usize;
+    if bytes == 0 {
+        return None;
+    }
+    // an address in the sparse windows without CPU pages (the title never maps these; committed
+    // pages cost RAM: w57 was RAM-killed at 100 s with them): its tiles get video memory only
+    let (p, _) = u.sparse_alloc(bytes, 0x1_0000)?;
+    let Some((hr, delta)) = super::sparse::place_buffer(this, p, &d, state & PC_RESOURCE_STATES, riid, ppv) else {
+        u.sparse_release(p);
+        return None;
+    };
+    UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes, true));
+    if delta != 0 {
+        BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
+    }
+    if hr >= 0 && !(*ppv).is_null() {
+        if let Some((p, _)) = console_buffer(*ppv as usize) {
+            let mut g = OUTSIDE_BUFFERS.lock().unwrap();
+            g.retain(|&(a, n, _)| a + n <= va || va + bytes <= a);
+            g.push((va, bytes, p));
+            let k = g.len();
+            // (whether the title has CPU pages at its address: then it may write the buffer there,
+            // and nothing carries those writes to the sparse windows yet)
+            let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            windows_sys::Win32::System::Memory::VirtualQuery(va as *const c_void, &mut mbi, std::mem::size_of_val(&mbi));
+            let committed = mbi.State == 0x1000;
+            static COMMITTED: AtomicU64 = AtomicU64::new(0);
+            let c = COMMITTED.fetch_add(committed as u64, Ordering::Relaxed) + committed as u64;
+            if k <= 12 || k.is_power_of_two() || (committed && c <= 40) {
+                crate::xlog_info!("lab: outside buffer #{k}: {:p} placed at {va:#x} ({bytes} bytes) lives at {p:#x} in the sparse windows; the title's pages there: state {:#x} protect {:#x} ({c} committed so far)", *ppv, mbi.State, mbi.Protect);
+            }
+        }
+    }
+    Some(hr)
+}
+
+/// lab: the address in the windows of title address `va` when it is in a buffer of `place_outside_buffer`.
+pub fn outside_buffer_address(va: usize) -> Option<usize> {
+    OUTSIDE_BUFFERS.lock().unwrap().iter().find(|&&(a, n, _)| va >= a && va < a + n).map(|&(a, _, p)| p + (va - a))
 }
 
 fn uma_shadowed() -> bool {

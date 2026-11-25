@@ -759,7 +759,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             // lab (`XCL_POST_PROBE`): kind `s` = sampled by the tone-map draw: whatever its size.
             // A 3-D texture (the colour LUTs): its first slice. A 1x1 / 2x2 target (the exposure) always.
             let shape = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || (kind == b's' && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D);
-            let small = d.Width < 128 && d.Width * d.Height as u64 > 4 && kind != b's' && kind != b'u';
+            let small = d.Width < 128 && d.Width * d.Height as u64 > 4 && kind != b's' && kind != b'u' && kind != b'o';
             if !shape || d.SampleDesc.Count > 1 || small || taken >= 300 || bytes > 1000 << 20 {
                 crate::xlog_info!("rt dump: {k} {} not copied: dimension {} {}x{} format {} samples {}", kind as char, d.Dimension.0, d.Width, d.Height, d.Format.0, d.SampleDesc.Count);
                 continue;
@@ -998,6 +998,12 @@ fn rt_dump_times() -> &'static [f64] {
     T.get_or_init(|| std::env::var("XCL_RT_DUMP").unwrap_or_default().split(',').filter_map(|v| v.trim().parse().ok()).collect())
 }
 
+/// lab: `XCL_RT_DUMP_ONLY=<cs record hash>,...` (hex)
+pub fn rt_dump_only() -> &'static [u64] {
+    static T: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::env::var("XCL_RT_DUMP_ONLY").unwrap_or_default().split(',').filter_map(|v| u64::from_str_radix(v.trim(), 16).ok()).collect())
+}
+
 pub fn rt_dump_on() -> bool {
     !rt_dump_times().is_empty()
 }
@@ -1027,6 +1033,10 @@ pub fn dsv_resource(handle: usize) -> Option<usize> {
 /// `res` was written this frame (kind b'c' colour target, b'd' depth, b'u' UAV)
 pub unsafe fn note_rt_dump(res: usize, kind: u8) {
     if !rt_dump_on() || res == 0 {
+        return;
+    }
+    // lab: `XCL_RT_DUMP_ONLY`: only what the named compute passes name (kind `o`)
+    if !rt_dump_only().is_empty() && kind != b'o' {
         return;
     }
     let mut g = RT_DUMP_SET.lock().unwrap();
@@ -1144,6 +1154,16 @@ unsafe fn write_rt(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     let mut p: *mut c_void = std::ptr::null_mut();
     if rb.Map(0, None, Some(&mut p)).is_err() || p.is_null() {
         return;
+    }
+    // lab: `XCL_RT_DUMP_ONLY`: the texels as they are, rows of `w` texels
+    if !rt_dump_only().is_empty() {
+        if let Some(boot) = crate::state::boot() {
+            let mut raw = Vec::with_capacity(w * h * bytes);
+            for y in 0..h {
+                raw.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + y * pitch), w * bytes));
+            }
+            let _ = std::fs::write(boot.logs_dir().join(format!("{tag}_{w}x{h}_f{}_b{bytes}.raw", format.0)), &raw);
+        }
     }
     let step = w.div_ceil(960).max(1);
     let (ow, oh) = ((w / step).max(1), (h / step).max(1));

@@ -2221,8 +2221,17 @@ unsafe fn rt_dump_note_compute(this: *mut c_void) {
         return;
     }
     let Some(u) = crate::gpu::uma::get() else { return };
-    let (layout, args) = with(this, |s| (s.layout.clone(), s.args.clone()));
+    let (layout, args, pso) = with(this, |s| (s.layout.clone(), s.args.clone(), s.pso));
     let Some(layout) = layout else { return };
+    // lab: `XCL_RT_DUMP_ONLY=<cs record hash>,...`: only what these passes name (every texture in
+    // the first 192 slots of their tables), each also as a `.raw` file
+    let only = super::present::rt_dump_only();
+    if !only.is_empty() {
+        let cs = super::real::pso_shaders(super::pso_async::resolve(pso)).map_or(0, |s| s.0);
+        if !only.contains(&cs) {
+            return;
+        }
+    }
     let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     for p in layout.params.iter() {
         let Param::Table { at } = *p else { continue };
@@ -2231,7 +2240,7 @@ unsafe fn rt_dump_note_compute(this: *mut c_void) {
             continue;
         }
         let t = u.base() + v as usize;
-        for k in 0..128usize {
+        for k in 0..if only.is_empty() { 128usize } else { 192 } {
             let slot = t + 32 * k;
             if !crate::gpu::shader::readable(slot, 32) {
                 break;
@@ -2239,8 +2248,8 @@ unsafe fn rt_dump_note_compute(this: *mut c_void) {
             let w0 = (slot as *const u32).read_unaligned();
             let r = super::console_heap::resource_at(slot).or_else(|| (w0 != 0).then(|| super::console_heap::resource_by_word0_cached(w0)).flatten());
             // (render targets, depth buffers and UAV textures: not the streamed ones)
-            if let Some(r) = r.filter(|&r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| { let d = x.GetDesc(); d.Flags.0 & 7 != 0 || d.Format.0 == 67 })) {
-                super::present::note_rt_dump(r, b'u');
+            if let Some(r) = r.filter(|&r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| { let d = x.GetDesc(); !only.is_empty() && d.Dimension.0 >= 2 || d.Flags.0 & 7 != 0 || d.Format.0 == 67 })) {
+                super::present::note_rt_dump(r, if only.is_empty() { b'u' } else { b'o' });
             }
         }
     }
@@ -2277,7 +2286,27 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     if first == 0 && u.shadowed() {
         return Err("window 0 of unified memory has no buffer on the GPU".into());
     }
-    let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
+    let (layout, mut args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
+    // lab: a root address in a buffer the title placed outside the windows: where that buffer
+    // lives in them (`real::place_outside_buffer`)
+    if let Some(l) = layout.as_deref() {
+        for p in l.params.iter() {
+            let Param::Descriptor { at } = *p else { continue };
+            let at = at as usize;
+            let Some(b) = args.get(at..at + 8) else { continue };
+            let va = u64::from_le_bytes(b.try_into().unwrap()) as usize;
+            if va >> 32 >= 0x14 {
+                if let Some(q) = super::real::outside_buffer_address(va) {
+                    args[at..at + 8].copy_from_slice(&(q as u64).to_le_bytes());
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+                    if k <= 8 || k.is_power_of_two() {
+                        crate::xlog_info!("lab: root address #{k} {va:#x} in an outside buffer -> {q:#x}");
+                    }
+                }
+            }
+        }
+    }
     // lab: what the shaders read of the title's memory outside the unified windows
     super::view_mem::ensure_for_draw(layout.as_deref(), &args);
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)

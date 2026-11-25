@@ -908,6 +908,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         if let Some(hr) = real::place_at_title_address(this, va as usize, &d, state, clear, riid, ppv) {
             return hr;
         }
+        // lab: outside every window: memory in the sparse windows (`real::place_outside_buffer`)
+        if let Some(hr) = real::place_outside_buffer(this, va as usize, &d, state, riid, ppv) {
+            return hr;
+        }
     }
     // render targets, depth buffers, UAV textures: in video memory, aliased by address (`vram`);
     // sampled textures: on the same shared 64 KiB pages when tiled resources allow, else committed
@@ -938,6 +942,16 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv)
         }
     };
+    // lab: a buffer the title placed outside the unified windows became a resource of its own:
+    // shaders get an empty V# for it (`real::buffer_view`); its address is kept for the log
+    if hr >= 0 && buffer && !(*ppv).is_null() {
+        real::note_title_address(*ppv as usize, va as usize);
+        static B: AtomicU64 = AtomicU64::new(0);
+        let k = B.fetch_add(1, Ordering::Relaxed) + 1;
+        if k <= 80 || k.is_power_of_two() {
+            crate::xlog_info!("lab: placed buffer #{k} outside the windows: {:p} at {va:#x}, {} bytes, flags {flags:#x}, state {state:#x}", *ppv, u64::from_le_bytes(d[0x10..0x18].try_into().unwrap()));
+        }
+    }
     // lab (`depth_twin`, alias pairs): a GPU-owned texture that became a resource of its own, and a
     // texture without flags placed where such a one is
     if hr >= 0 && !buffer && !(*ppv).is_null() {
