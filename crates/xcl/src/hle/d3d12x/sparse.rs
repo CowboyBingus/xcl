@@ -460,7 +460,7 @@ unsafe fn wait_fence(fence: &ID3D12Fence, target: u64) -> bool {
     let event = EVENT.with(|e| *e);
     let start = std::time::Instant::now();
     loop {
-        let at = fence.GetCompletedValue();
+        let at = super::real::fence_completed(fence);
         if at >= target {
             return true;
         }
@@ -521,7 +521,7 @@ unsafe fn readback_released(mut g: MutexGuard<'static, Option<State>>, ranges: &
             let Some(s) = g.as_mut() else { return };
             // (a copy given up earlier: its list and the buffer are still in use)
             let last = s.rb_last_fence;
-            if last != 0 && s.fence.GetCompletedValue() < last {
+            if last != 0 && super::real::fence_completed(&s.fence) < last {
                 let (again, there) = wait_released(g, last);
                 g = again;
                 if !there {
@@ -833,7 +833,7 @@ impl State {
     /// 0.29 GB of tiles in use). Call after their tiles are unmapped and signalled.
     fn retire_free_pools(&mut self) {
         let now = std::time::Instant::now();
-        let done = unsafe { self.fence.GetCompletedValue() };
+        let done = unsafe { super::real::fence_completed(&self.fence) };
         self.retired.retain(|(_, v, at)| !(done >= *v && now.duration_since(*at).as_secs() >= 2));
         if self.free.len() < POOL_TILES as usize {
             return;
@@ -1005,13 +1005,13 @@ impl State {
 
     #[inline]
     unsafe fn wait_for(&self, target: u64) {
-        if target == 0 || self.fence.GetCompletedValue() >= target {
+        if target == 0 || super::real::fence_completed(&self.fence) >= target {
             return;
         }
         let _ = self.fence.SetEventOnCompletion(target, self.event);
         windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-        if self.fence.GetCompletedValue() < target {
-            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
+        if super::real::fence_completed(&self.fence) < target {
+            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", super::real::fence_completed(&self.fence));
         }
     }
 
@@ -1020,7 +1020,7 @@ impl State {
         if self.inflight.is_empty() {
             return;
         }
-        let completed = self.fence.GetCompletedValue();
+        let completed = super::real::fence_completed(&self.fence);
         while let Some(&(fv, end_pos)) = self.inflight.front() {
             if fv <= completed {
                 self.ring_free = end_pos;
@@ -1041,7 +1041,7 @@ impl State {
             return Ok(0);
         }
         self.reclaim_ring();
-        let completed = self.fence.GetCompletedValue();
+        let completed = super::real::fence_completed(&self.fence);
         for k in 0..self.slots.len().min(2) {
             let fv = self.slots[(self.next_slot + k) % self.slots.len()].fence_val;
             if fv > completed {
@@ -1075,7 +1075,7 @@ impl State {
         let idx = self.next_slot;
         self.next_slot = (self.next_slot + 1) % self.slots.len();
         let fv = self.slots[idx].fence_val;
-        if fv > 0 && self.fence.GetCompletedValue() < fv {
+        if fv > 0 && super::real::fence_completed(&self.fence) < fv {
             self.wait_for(fv);
             self.reclaim_ring();
         }
@@ -1324,14 +1324,14 @@ impl State {
     unsafe fn drain_readbacks(&mut self, how: Drain) {
         let Some((_, done)) = self.rbq.clone() else { return };
         while let Some((rb_v, done_v)) = self.rb_jobs.front().map(|j| (j.rb_v, j.done_v)) {
-            if done.GetCompletedValue() < done_v {
-                if how == Drain::Finished || self.rb_fence.GetCompletedValue() < rb_v {
+            if super::real::fence_completed(&done) < done_v {
+                if how == Drain::Finished || super::real::fence_completed(&self.rb_fence) < rb_v {
                     break;
                 }
                 // the title's lists are done: only the copy itself is left
                 let _ = done.SetEventOnCompletion(done_v, self.event);
                 windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-                if done.GetCompletedValue() < done_v {
+                if super::real::fence_completed(&done) < done_v {
                     crate::xlog_warn!("sparse: a copy back has not finished 5 s after the title's work it follows");
                     break;
                 }
@@ -1597,7 +1597,7 @@ unsafe fn settle_released(mut g: MutexGuard<'static, Option<State>>, patient: bo
         s.drain_readbacks(Drain::Finished);
         let Some((_, done)) = s.rbq.clone() else { return Some(g) };
         let Some((rb_v, done_v)) = s.rb_jobs.front().map(|j| (j.rb_v, j.done_v)) else { return Some(g) };
-        if s.rb_fence.GetCompletedValue() < rb_v {
+        if super::real::fence_completed(&s.rb_fence) < rb_v {
             return Some(g);
         }
         drop(g);
