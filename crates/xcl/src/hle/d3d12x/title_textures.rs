@@ -570,6 +570,27 @@ pub fn list_reset(list: usize) {
     }
 }
 
+/// Page budget: about once a second, the textures whose T# is in a shader-visible view heap
+/// are in use (a title that only samples a texture submits no transition for it); evicted ones
+/// among them are mapped again before the title's next work.
+fn look_at_view_heaps() {
+    if !super::vram::tracking() || super::console_heap::global_heap().is_none() {
+        return;
+    }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        let now = std::time::Instant::now();
+        if last.is_some_and(|l| now.duration_since(l) < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        *last = Some(now);
+    }
+    let (visible, cpu_only) = super::console_heap::referenced();
+    let back = super::vram::seen(&visible, &cpu_only);
+    revive_named(back);
+}
+
 /// The PC lists `lists` were submitted, in this order: the textures kept in step are in the
 /// states their transitions leave them in.
 pub fn submitted(lists: &[*mut c_void]) {
@@ -610,6 +631,16 @@ pub(super) fn revive_listed(lists: &[*mut c_void]) {
     }
     named.sort_unstable();
     named.dedup();
+    revive_named(named);
+}
+
+/// Page budget: the evicted textures `named` (sorted, no repeats) are mapped again and made
+/// pending, to be uploaded whole at the next look. One released meanwhile is left alone; one
+/// that cannot be mapped now stays evicted, for its next use to try again.
+fn revive_named(mut named: Vec<usize>) {
+    if named.is_empty() {
+        return;
+    }
     // a reference each while they are mapped (taken under the lock `forget` takes)
     let live = {
         let t = TEXTURES.lock().unwrap();
@@ -793,6 +824,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
             crate::xlog_info!("frame trace: title textures: {with} with data in memory, {without} all zero; {dirty_len} dirty pages this look");
         }
     }
+    // page budget: textures in use by their T#; evicted ones are mapped again (before the
+    // queue waits for the mappings) and uploaded below
+    look_at_view_heaps();
     // the title's own memory: what the CPU wrote goes to its video memory first
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         DIRTY_BUF.with(|dcell| {
