@@ -758,6 +758,47 @@ pub unsafe fn shadow_window(dev: &ID3D12Device, base: usize, size: usize, buf: &
     true
 }
 
+/// lab (`XCL_SHADOW_TILED=1`): the shadowed committed window `[lo, hi)` whose copy in video
+/// memory is a reserved buffer with tiles mapped on demand (0, 0: none)
+static LAZY: [std::sync::atomic::AtomicUsize; 2] = [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+
+/// lab: the window of `shadow_window_tiled`, if any.
+pub fn lazy_range() -> Option<(usize, usize)> {
+    let (lo, hi) = (LAZY[0].load(Ordering::Acquire), LAZY[1].load(Ordering::Acquire));
+    (hi > lo).then_some((lo, hi))
+}
+
+/// lab: whether `va` is in the window of `shadow_window_tiled`.
+pub fn is_lazy(va: usize) -> bool {
+    lazy_range().is_some_and(|(lo, hi)| va >= lo && va < hi)
+}
+
+/// lab: `shadow_window` with a reserved buffer `buf` and no video memory to begin with: a
+/// tile is mapped (a pool tile, as in the sparse windows) when the CPU first writes one of its
+/// pages (`before_execute`) or the title places a buffer over it (`place_buffer`). The rest -
+/// a retail title's render targets are 3.4 GB of this window's addresses and have pages of
+/// their own (`vram`) - takes none. Memory only shaders write, with no buffer placed there,
+/// is not kept.
+pub unsafe fn shadow_window_tiled(dev: &ID3D12Device, base: usize, size: usize, buf: &ID3D12Resource) -> bool {
+    let mut g = lock_state();
+    if g.is_none() {
+        match new_state(dev, Vec::new()) {
+            Ok(s) => *g = Some(s),
+            Err(e) => {
+                crate::xlog_warn!("shadowed window at {base:#x}: {e}");
+                return false;
+            }
+        }
+    }
+    let Some(s) = g.as_mut() else { return false };
+    s.windows.push((base, buf.clone()));
+    LAZY[0].store(base, Ordering::Release);
+    LAZY[1].store(base + size, Ordering::Release);
+    s.runs = None;
+    MAPPED_GEN.fetch_add(1, Ordering::Release);
+    true
+}
+
 /// The sparse windows' buffers on `dev`: `(window_index, buffer_raw, gpu_va)` for each
 /// sparse window in `gpu::uma` (empty: no sparse windows).
 pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
@@ -2039,6 +2080,27 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let (again, room) = room_released(g, if dirty.is_empty() { 0 } else { page }, true);
     g = again;
     let (Some(mut s), Some(mut left)) = (g.as_mut(), room) else { return };
+    // lab: pages written in the tiled shadow window get their tiles first (before the clears:
+    // a reused tile is cleared, then written)
+    if let Some((lo, hi)) = lazy_range() {
+        let mut last = 0usize;
+        let mut new = 0u64;
+        for &a in dirty {
+            let t = a & !(TILE - 1);
+            if t != last && t >= lo && t < hi && !s.mapped.contains_key(&t) {
+                s.ensure_mapped(t, TILE, |_| 0);
+                new += 1;
+            }
+            last = t;
+        }
+        if new > 0 {
+            static TILES: AtomicU64 = AtomicU64::new(0);
+            let n = TILES.fetch_add(new, Ordering::Relaxed) + new;
+            if (n - new).next_power_of_two() <= n || n.is_power_of_two() {
+                crate::xlog_info!("lab: tiled shadow: {} MB of tiles mapped for CPU writes so far", n >> 4);
+            }
+        }
+    }
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
     let zero_runs = s.flush_zeros();
     let mut dirty_runs = std::mem::take(&mut s.scratch_runs);

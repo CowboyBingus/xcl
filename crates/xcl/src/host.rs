@@ -46,6 +46,26 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
+            let mut ticks = 0u32;
+            // lab: bytes of `[base, base + size)` that are in the process's working set
+            let resident_bytes = |base: usize, size: usize| -> u64 {
+                use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+                const PAGES: usize = 1 << 16;
+                let mut buf: Vec<PSAPI_WORKING_SET_EX_INFORMATION> = vec![unsafe { std::mem::zeroed() }; PAGES];
+                let (mut n, mut at) = (0u64, base);
+                while at < base + size {
+                    let count = PAGES.min((base + size - at) >> 12);
+                    for (i, e) in buf[..count].iter_mut().enumerate() {
+                        e.VirtualAddress = (at + (i << 12)) as *mut _;
+                    }
+                    let ok = unsafe { K32QueryWorkingSetEx(windows_sys::Win32::System::Threading::GetCurrentProcess(), buf.as_mut_ptr() as *mut _, (count * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32) };
+                    if ok != 0 {
+                        n += buf[..count].iter().filter(|e| unsafe { e.VirtualAttributes.Flags } & 1 != 0).count() as u64;
+                    }
+                    at += count << 12;
+                }
+                n << 12
+            };
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -80,6 +100,51 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                // lab: what is resident (the commit above is not), the card's budget, the parts
+                let (ws, avail) = unsafe {
+                    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+                    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+                    let mut c: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+                    c.cb = std::mem::size_of_val(&c) as u32;
+                    K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb);
+                    let mut m: MEMORYSTATUSEX = std::mem::zeroed();
+                    m.dwLength = std::mem::size_of_val(&m) as u32;
+                    GlobalMemoryStatusEx(&mut m);
+                    (c.WorkingSetSize as u64, m.ullAvailPhys)
+                };
+                let budget = crate::hle::d3d12x::real::video_budget().unwrap_or(0);
+                let (res, res_held, res_free) = crate::hle::d3d12x::bind::res_stats();
+                let (clamp, clamp_made) = crate::hle::d3d12x::bind::clamp_stats();
+                crate::xlog_info!(
+                    "memory lab: working set {} MB, system free {} MB, video budget {} MB; record buffers {} MB ({} allocators hold some, {} free); clamp buffers {} MB ({} made); {}",
+                    mb(ws),
+                    mb(avail),
+                    mb(budget),
+                    mb(res),
+                    res_held,
+                    res_free,
+                    mb(clamp),
+                    clamp_made,
+                    crate::hle::d3d12x::vram::page_breakdown()
+                );
+                // lab: every 10 s, how much of each memory window is in the working set
+                // (pages the title or XCL touched and Windows has not trimmed)
+                ticks += 1;
+                if ticks % 5 == 0 {
+                    if let Some(u) = crate::gpu::uma::get() {
+                        let parts: Vec<String> = (0..u.shader_windows())
+                            .map(|k| {
+                                let (base, size) = u.window(k);
+                                format!("window {k}{} {} MB", if u.is_sparse_window(k) { " (sparse)" } else if u.is_committed_window(k) { " (coherent)" } else { "" }, mb(resident_bytes(base, size)))
+                            })
+                            .collect();
+                        crate::xlog_info!("memory lab: in the working set: {}", parts.join(", "));
+                        crate::xlog_info!("memory lab: {}", crate::hle::d3d12x::vram::pinned_sizes());
+                        // the title's memory past the windows (the CPU view of its 24 GB GPU view)
+                        let end = u.base() + (u.shader_windows() << 32);
+                        crate::xlog_info!("memory lab: in the working set: {} MB of the 24 GB after the windows ({end:#x}..)", mb(resident_bytes(end, 24 << 30)));
+                    }
+                }
                 let (evicted, mapped_again) = crate::hle::d3d12x::vram::eviction_counts();
                 if evicted > 0 {
                     crate::xlog_info!("page budget: {evicted} textures evicted, {mapped_again} mapped again");

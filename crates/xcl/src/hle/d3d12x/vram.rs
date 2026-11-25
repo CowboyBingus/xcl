@@ -1231,6 +1231,68 @@ pub fn page_bytes() -> (usize, usize) {
     })
 }
 
+/// lab: the pinned (never evicted) textures on pages by size, the 12 sizes that take most:
+/// "count x MB (pages no other texture shares, MB)".
+pub fn pinned_sizes() -> String {
+    let g = PAGES.lock().unwrap();
+    let mut by: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
+    let (mut alone_all, mut mapped_all) = (0u64, 0u64);
+    for p in g.values().flatten() {
+        for t in p.targets.values().filter(|t| t.mapped && !t.evictable) {
+            let alone = t.used.iter().filter(|a| p.pages.get(a).is_some_and(|x| x.users <= 1)).count() + t.used_extra.iter().filter(|k| p.extra_pages.get(k).is_some_and(|x| x.users <= 1)).count();
+            let e = by.entry(t.total).or_default();
+            e.0 += 1;
+            e.1 += alone as u64;
+            alone_all += alone as u64;
+            mapped_all += (t.used.len() + t.used_extra.len()) as u64;
+        }
+    }
+    let mut v: Vec<(u32, (u64, u64))> = by.into_iter().collect();
+    v.sort_unstable_by_key(|&(total, (n, _))| std::cmp::Reverse(u64::from(total) * n));
+    let parts: Vec<String> = v.iter().take(12).map(|&(total, (n, alone))| format!("{n} x {:.1} MB ({} MB alone)", f64::from(total) / 16.0, alone >> 4)).collect();
+    format!("pinned textures hold {} MB of page uses, {} MB of pages only one of them uses: {}", mapped_all >> 4, alone_all >> 4, parts.join(", "))
+}
+
+/// lab: what the pages hold, for the memory line of `XCL_ACTIVITY`: MB of tiles by kind of
+/// texture (a page shared by textures counts for each), free and cooling tiles.
+pub fn page_breakdown() -> String {
+    let g = PAGES.lock().unwrap();
+    let now = std::time::Instant::now();
+    // [evictable seen, evictable unseen, evictable CPU-only, pinned GPU-owned, pinned other, unmapped]
+    let (mut n, mut tiles) = ([0u64; 6], [0u64; 6]);
+    let (mut young, mut free, mut cooling, mut idle) = (0u64, 0usize, 0usize, 0usize);
+    for p in g.values().flatten() {
+        for t in p.targets.values() {
+            let k = if !t.mapped {
+                5
+            } else if t.evictable {
+                if now.duration_since(t.touched) < EVICT_MIN_AGE {
+                    young += u64::from(t.total);
+                }
+                match t.seen {
+                    Seen::Visible => 0,
+                    Seen::None => 1,
+                    Seen::CpuOnly => 2,
+                }
+            } else if t.gpu_owned {
+                3
+            } else {
+                4
+            };
+            n[k] += 1;
+            tiles[k] += u64::from(t.total);
+        }
+        free += p.pool.free_total;
+        cooling += p.pool.cooling.len();
+        idle += p.idle.len();
+    }
+    let mb = |t: u64| t >> 4;
+    format!(
+        "pages by texture: evictable seen {} MB ({}), unseen {} MB ({}), CPU-only {} MB ({}), of them touched in the last 5 s {} MB; pinned GPU-owned {} MB ({}), pinned other {} MB ({}); evicted {} MB ({}); free tiles {} MB, cooling {} MB, idle pages {} MB",
+        mb(tiles[0]), n[0], mb(tiles[1]), n[1], mb(tiles[2]), n[2], mb(young), mb(tiles[3]), n[3], mb(tiles[4]), n[4], mb(tiles[5]), n[5], free >> 4, cooling >> 4, idle >> 4
+    )
+}
+
 /// Heaps of every kind of resource in one (resource heap tier 2) – else no arenas.
 fn tier2(dev: &ID3D12Device) -> bool {
     let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();

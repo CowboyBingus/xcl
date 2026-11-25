@@ -55,8 +55,25 @@ pub(super) fn release_allocator_res(allocator: usize) {
     for b in bufs {
         if free.len() < 16 {
             free.push(b);
+        } else {
+            RES_LIVE.fetch_sub(b.1 as i64, Ordering::Relaxed);
         }
     }
+}
+
+/// lab: bytes of two-pass record buffers that exist (in use, held until their allocator's
+/// reset, or free)
+static RES_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// lab: (bytes of the bounded copies' buffers that exist, buffers made so far) – `XCL_ACTIVITY`
+pub fn clamp_stats() -> (u64, u64) {
+    super::indirect_clamp::scratch_stats()
+}
+
+/// lab: (bytes of record buffers that exist, allocators holding some, free ones) – `XCL_ACTIVITY`
+pub fn res_stats() -> (u64, usize, usize) {
+    let held = ALLOC_RES.lock().unwrap().as_ref().map_or(0, |m| m.len());
+    (RES_LIVE.load(Ordering::Relaxed).max(0) as u64, held, FREE_RES.lock().unwrap().len())
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -379,6 +396,7 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
             if n <= 4 || n.is_power_of_two() || n % 32 == 0 {
                 crate::xlog_info!("D3D12.X: two-pass record buffer #{n} of {} MiB made ({} MiB made so far, {} free)", need >> 20, made >> 20, FREE_RES.lock().unwrap().len());
             }
+            RES_LIVE.fetch_add(need as i64, Ordering::Relaxed);
             (default_uav_buffer(&dev, need, "two-pass res buffer")?, need, dev_key)
         }
     };
@@ -684,7 +702,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 return;
             }
             let (args, args_off) = match &bounded {
-                Some(b) => (b.raw(), 0),
+                Some(b) => (b.raw(), b.offset()),
                 None => (args, args_off),
             };
             ei_peek(this, 0, max, args, args_off + u64::from(msig.mesh_offset), count_buf, count_off);
@@ -823,7 +841,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // list's compute bindings, which `bind_abi` sets again
     let bounded = super::indirect_clamp::bound(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off);
     match &bounded {
-        Some(b) => ei_peek(this, if gfx { 1 } else { 2 }, max, b.raw(), 0, count_buf, count_off),
+        Some(b) => ei_peek(this, if gfx { 1 } else { 2 }, max, b.raw(), b.offset(), count_buf, count_off),
         None => ei_peek(this, if gfx { 1 } else { 2 }, max, args, args_off, count_buf, count_off),
     }
     // lab (`XCL_EI_PEEK`): the first 3 calls of each pipeline with its shader (PS / CS record hash)
@@ -839,7 +857,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             };
             if n <= 3 {
                 let slot = match &bounded {
-                    Some(b) => ei_peek_slot(this, if gfx { 20 } else { 21 }, max, b.raw(), 0, count_buf, count_off),
+                    Some(b) => ei_peek_slot(this, if gfx { 20 } else { 21 }, max, b.raw(), b.offset(), count_buf, count_off),
                     None => ei_peek_slot(this, if gfx { 20 } else { 21 }, max, args, args_off, count_buf, count_off),
                 };
                 if let Some(slot) = slot {
@@ -865,7 +883,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         ei_work(this, sig, super::targets::RAN);
         count(if gfx { DRAWS } else { DISPATCHES });
         fresh_indirect_arguments(this, || match &bounded {
-            Some(b) => pc(this, sig, max, b.raw(), 0, count_buf, count_off),
+            Some(b) => pc(this, sig, max, b.raw(), b.offset(), count_buf, count_off),
             None => pc(this, sig, max, args, args_off, count_buf, count_off),
         });
         for (res, plane) in twins {

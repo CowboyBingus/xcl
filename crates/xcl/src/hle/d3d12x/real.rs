@@ -344,9 +344,23 @@ unsafe fn open_uma(device: &ID3D12Device) {
     let mut bufs: Vec<(usize, u64)> = vec![(0, 0); n];
     let mut heaps: Vec<Option<usize>> = vec![None; n];
     let mut shadows: Vec<(usize, ID3D12Resource)> = Vec::new();
+    // lab: `XCL_SHADOW_TILED=1` (with `XCL_UMA_SHADOW=1`): the copy is a reserved buffer whose
+    // tiles get video memory on demand (`sparse::shadow_window_tiled`)
+    let tiled = shadow_choice() == Some(true) && std::env::var("XCL_SHADOW_TILED").is_ok_and(|v| v.trim() == "1");
+    let mut tiled_shadows: Vec<(usize, ID3D12Resource)> = Vec::new();
     for k in 0..n {
         if !u.is_committed_window(k) {
             continue;
+        }
+        if tiled && tiled_shadows.is_empty() {
+            let mut buf: Option<ID3D12Resource> = None;
+            if device.CreateReservedResource(&buffer(u.window(k).1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_COMMON, None, &mut buf).is_ok() {
+                if let Some(buf) = buf {
+                    bufs[k] = (buf.clone().into_raw() as usize, buf.GetGPUVirtualAddress());
+                    tiled_shadows.push((k, buf));
+                    continue;
+                }
+            }
         }
         let made = open(k).and_then(|heap| {
             let shadowed = heap.is_none();
@@ -376,7 +390,7 @@ unsafe fn open_uma(device: &ID3D12Device) {
             }
         }
     }
-    let check = if !shadows.is_empty() {
+    let check = if !shadows.is_empty() || !tiled_shadows.is_empty() {
         Ok("not run: the coherent window has a copy in video memory (no host-memory heaps on this D3D12)".into())
     } else if std::env::var("XCL_UMA_CHECK").is_ok_and(|v| v == "0") {
         Ok("off (XCL_UMA_CHECK=0)".into())
@@ -402,6 +416,15 @@ unsafe fn open_uma(device: &ID3D12Device) {
         w0_va
     );
     *UMA_HEAPS.lock().unwrap() = heaps;
+    for (k, buf) in &tiled_shadows {
+        let (base, size) = u.window(*k);
+        u.set_shadowed();
+        if super::sparse::shadow_window_tiled(device, base, size, buf) {
+            crate::xlog_warn!("D3D12.X: UMA window {k} is not shared with the GPU (XCL_UMA_SHADOW=1, XCL_SHADOW_TILED=1): a reserved buffer at VA {:#x} stands for it, with video memory for the tiles the CPU writes or buffers are placed on", bufs[*k].1);
+        } else {
+            crate::xlog_warn!("D3D12.X: UMA window {k} is not shared with the GPU and its copy in video memory is not kept in step");
+        }
+    }
     for (k, buf) in &shadows {
         let (base, size) = u.window(*k);
         u.set_shadowed();
@@ -492,6 +515,21 @@ pub fn video_memory() -> Option<(u64, u64)> {
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
         Some((local.CurrentUsage, non_local.CurrentUsage))
+    }
+}
+
+/// lab: the local video-memory budget Windows gives the process now (beyond it, video memory
+/// goes to system memory)
+pub fn video_budget() -> Option<u64> {
+    use windows::Win32::Graphics::Dxgi::*;
+    let raw = device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(dev.GetAdapterLuid()).ok()?;
+        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
+        Some(local.Budget)
     }
 }
 
@@ -1492,6 +1530,10 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
             return Some(hr);
         }
     }
+    // lab: a tiled shadow window has no heap to place a buffer in
+    if super::sparse::lazy_range().is_some() {
+        return if u.has_sparse() { place_console_buffer_sparse(this, &d, bytes, st, readback_on_null_map, riid, ppv) } else { None };
+    }
     let Some(p) = u.alloc(rounded, 0x1_0000).map(|a| a as usize) else {
         if prefer_coherent && u.has_sparse() {
             return place_console_buffer_sparse(this, &d, bytes, st, readback_on_null_map, riid, ppv);
@@ -1552,7 +1594,8 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
         return None;
     }
     // the title's own memory (a sparse window): a resource over its video-memory tiles
-    if u.is_sparse(va) {
+    // (lab: also in a tiled shadow window)
+    if u.is_sparse(va) || super::sparse::is_lazy(va) {
         let (hr, delta) = super::sparse::place_buffer(this, va, &d, state, riid, ppv)?;
         UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
         if delta != 0 {

@@ -155,22 +155,53 @@ unsafe fn make_clamper(dev: &ID3D12Device) -> Result<Clamper, String> {
 struct Scratch {
     held: HashMap<usize, Vec<(usize, u64, ID3D12Resource)>>,
     free: Vec<(usize, u64, ID3D12Resource)>,
+    /// allocator → bytes taken of the last buffer it holds
+    taken: HashMap<usize, u64>,
+}
+
+/// bytes of a buffer the copies of an allocator's calls are cut from. A buffer for each call
+/// (64 KiB at least, a committed resource each) was thousands of resources a frame in a
+/// retail title's world – made and released again with every allocator reset beyond the
+/// `FREE_KEPT`: video memory and the working set grew by 2 GB in the 8 s after the world began.
+const CHUNK: u64 = 1 << 20;
+/// (bytes of buffers that exist, buffers made so far) – `XCL_ACTIVITY`
+static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// lab: (bytes of the copies' buffers that exist, buffers made so far)
+pub fn scratch_stats() -> (u64, u64) {
+    (LIVE[0].load(std::sync::atomic::Ordering::Relaxed), LIVE[1].load(std::sync::atomic::Ordering::Relaxed))
 }
 
 static SCRATCH: Mutex<Option<Scratch>> = Mutex::new(None);
 /// free buffers kept for reuse (the rest are released)
 const FREE_KEPT: usize = 64;
 
-/// A buffer of at least `bytes` in UNORDERED_ACCESS, held for `allocator` until its reset.
-unsafe fn scratch(dev: &ID3D12Device, allocator: usize, bytes: u64) -> Option<ID3D12Resource> {
+/// `bytes` of a buffer in UNORDERED_ACCESS (the buffer and the offset in it), held for
+/// `allocator` until its reset: the next bytes of the buffer its last call took from, or a new
+/// buffer of `CHUNK` at least. Calls of one allocator are recorded one after the other, each
+/// leaves the buffer in UNORDERED_ACCESS again (`Bounded::finish`).
+unsafe fn scratch(dev: &ID3D12Device, allocator: usize, bytes: u64) -> Option<(ID3D12Resource, u64)> {
     let key = dev.as_raw() as usize;
+    let bytes = bytes.max(4).next_multiple_of(256);
     let mut g = SCRATCH.lock().unwrap();
     let s = g.get_or_insert_with(Default::default);
+    if allocator != 0 {
+        if let Some((d, size, r)) = s.held.get(&allocator).and_then(|v| v.last()) {
+            let at = s.taken.get(&allocator).copied().unwrap_or(*size);
+            if *d == key && at + bytes <= *size {
+                let r = r.clone();
+                s.taken.insert(allocator, at + bytes);
+                return Some((r, at));
+            }
+        }
+    }
     let reuse = s.free.iter().enumerate().filter(|(_, (d, n, _))| *d == key && *n >= bytes).min_by_key(|(_, (_, n, _))| *n).map(|(i, _)| i);
     let entry = match reuse {
         Some(i) => s.free.swap_remove(i),
         None => {
-            let size = bytes.next_power_of_two().max(64 << 10);
+            let size = bytes.next_power_of_two().max(CHUNK);
+            LIVE[0].fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            LIVE[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut out: Option<ID3D12Resource> = None;
             dev.CreateCommittedResource(
                 &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -196,7 +227,8 @@ unsafe fn scratch(dev: &ID3D12Device, allocator: usize, bytes: u64) -> Option<ID
     };
     let r = entry.2.clone();
     s.held.entry(allocator).or_default().push(entry);
-    Some(r)
+    s.taken.insert(allocator, bytes);
+    Some((r, 0))
 }
 
 /// The GPU is done with what lists recorded from `allocator` (reset or released): its copies
@@ -210,6 +242,7 @@ pub(super) fn allocator_reset(allocator: usize) {
     {
         let mut g = SCRATCH.lock().unwrap();
         let Some(s) = g.as_mut() else { return };
+        s.taken.remove(&allocator);
         if let Some(done) = s.held.remove(&allocator) {
             s.free.extend(done);
             if s.free.len() > FREE_KEPT {
@@ -218,6 +251,7 @@ pub(super) fn allocator_reset(allocator: usize) {
             }
         }
     }
+    LIVE[0].fetch_sub(over.iter().map(|e| e.1).sum::<u64>(), std::sync::atomic::Ordering::Relaxed);
     drop(over);
 }
 
@@ -258,13 +292,19 @@ unsafe fn transition(list: &ID3D12GraphicsCommandList, r: &ID3D12Resource, befor
     ManuallyDrop::drop(&mut t.pResource);
 }
 
-/// A bounded copy of a call's records, in INDIRECT_ARGUMENT until [`Bounded::finish`].
-pub(super) struct Bounded(ID3D12Resource);
+/// A bounded copy of a call's records (the buffer and the copy's offset in it), in
+/// INDIRECT_ARGUMENT until [`Bounded::finish`].
+pub(super) struct Bounded(ID3D12Resource, u64);
 
 impl Bounded {
-    /// The copy, for the PC ExecuteIndirect (at offset 0).
+    /// The copy's buffer, for the PC ExecuteIndirect (the copy is at [`Bounded::offset`]).
     pub(super) fn raw(&self) -> usize {
         self.0.as_raw() as usize
+    }
+
+    /// Where the copy is in its buffer.
+    pub(super) fn offset(&self) -> u64 {
+        self.1
     }
 
     /// After the PC call: back to UNORDERED_ACCESS (the state each use starts from; a list may
@@ -351,19 +391,19 @@ pub(super) unsafe fn bound_within(
     list.GetDevice(&mut dev).ok()?;
     let dev = dev?;
     let c = clamper(&dev)?;
-    let out = scratch(&dev, allocator, bytes)?;
+    let (out, out_at) = scratch(&dev, allocator, bytes)?;
     let cfg = config(s, max, source_at, count_at, budget);
     // the title's writes to its records (through any view) before our reads
     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() }]);
     list.SetPipelineState(&c.pso);
     list.SetComputeRootSignature(&c.root);
     list.SetComputeRootUnorderedAccessView(0, source);
-    list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+    list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress() + out_at);
     list.SetComputeRootUnorderedAccessView(2, counts);
     list.SetComputeRoot32BitConstants(3, CONFIG_WORDS, cfg.as_ptr().cast(), 0);
     list.Dispatch(1, 1, 1);
     transition(list, &out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-    Some(Bounded(out))
+    Some(Bounded(out, out_at))
 }
 
 #[cfg(test)]

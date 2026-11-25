@@ -785,7 +785,9 @@ pub(super) fn drawn(res: &[usize]) {
 
 /// Slots of a bound descriptor table looked at (`tables_drawn`): a table's length is not in the
 /// root signature the title gives, and an image T# read past its end keeps one more texture at worst.
-const TABLE_SLOTS: usize = 16;
+/// (lab: 16 missed one bitmap layer of a loading card – two Scaleform tables named an evicted
+/// texture in slots 16..64, run m1)
+const TABLE_SLOTS: usize = 64;
 /// How often one table (by address) is looked at.
 const TABLE_LOOK_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -810,7 +812,19 @@ pub(super) fn tables_drawn(tables: &[usize]) {
     };
     let mut named = Vec::new();
     for at in due {
-        for res in table_textures(at, TABLE_SLOTS, super::console_heap::index_resource) {
+        let first = table_textures(at, TABLE_SLOTS, super::console_heap::index_resource);
+        // lab: evicted textures named past the slots looked at (they stay evicted)
+        if super::vram::any_evicted() {
+            let past = table_textures(at, 4 * TABLE_SLOTS, super::console_heap::index_resource).into_iter().filter(|r| !first.contains(r) && super::vram::is_evicted(*r)).count() as u64;
+            if past > 0 {
+                static PAST: AtomicU64 = AtomicU64::new(0);
+                let n = PAST.fetch_add(past, Ordering::Relaxed) + past;
+                if n.is_power_of_two() || (n - past).next_power_of_two() <= n {
+                    crate::xlog_info!("lab: table touch: {n} evicted textures named in slots {TABLE_SLOTS}..{} of bound tables so far (table {at:#x}: {past})", 4 * TABLE_SLOTS);
+                }
+            }
+        }
+        for res in first {
             if !named.contains(&res) {
                 named.push(res);
             }
@@ -864,6 +878,9 @@ fn revive_named(mut named: Vec<usize>) {
     if named.is_empty() {
         return;
     }
+    // lab: [named, not kept in step, not mapped again, mapped again but GPU-written (not uploaded), no entry]
+    static LAB: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    let asked = named.len();
     // a reference each while they are mapped (taken under the lock `forget` takes)
     let live = {
         let t = TEXTURES.lock().unwrap();
@@ -871,19 +888,42 @@ fn revive_named(mut named: Vec<usize>) {
         unsafe { clone_resources(&named) }
     };
     let revived: Vec<usize> = live.iter().filter(|r| unsafe { super::vram::revive(r) }).map(|r| r.as_raw() as usize).collect();
-    if revived.is_empty() {
-        return;
-    }
-    for &res in &revived {
-        forget_content(res);
-    }
-    let mut t = TEXTURES.lock().unwrap();
-    for res in revived {
-        if let Some(e) = t.get_mut(res) {
-            if !e.pending && !e.gpu_written {
-                e.pending = true;
-                PENDING.fetch_add(1, Ordering::Relaxed);
+    LAB[0].fetch_add(asked as u64, Ordering::Relaxed);
+    LAB[1].fetch_add((asked - named.len()) as u64, Ordering::Relaxed);
+    LAB[2].fetch_add((live.len() - revived.len()) as u64, Ordering::Relaxed);
+    let (mut written, mut gone) = (0u64, 0u64);
+    if !revived.is_empty() {
+        for &res in &revived {
+            forget_content(res);
+        }
+        let mut t = TEXTURES.lock().unwrap();
+        for &res in &revived {
+            match t.get_mut(res) {
+                Some(e) => {
+                    if e.gpu_written {
+                        written += 1;
+                    }
+                    if !e.pending && !e.gpu_written {
+                        e.pending = true;
+                        PENDING.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                None => gone += 1,
             }
+        }
+    }
+    LAB[3].fetch_add(written, Ordering::Relaxed);
+    LAB[4].fetch_add(gone, Ordering::Relaxed);
+    let bad = asked - revived.len() + written as usize + gone as usize;
+    if bad > 0 {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        let n = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            let c: Vec<u64> = LAB.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+            crate::xlog_info!(
+                "lab: page budget revive #{n}: of {} evicted textures named so far {} are not kept in step, {} could not be mapped again, {} came back GPU-written (not uploaded), {} have no entry",
+                c[0], c[1], c[2], c[3], c[4]
+            );
         }
     }
 }
@@ -943,6 +983,8 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     regions.extend(crate::hle::kernelx::graphics_reservations());
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().flat_map(|e| e.src.ranges(e.tex.size() as usize).map(|(s, e)| (s & !0xFFF, (e + 0xFFF) & !0xFFF)).collect::<Vec<_>>()).collect();
     wanted.extend(super::sparse::mapped_ranges());
+    // lab: every page of a tiled shadow window is watched (a first write maps its tile)
+    wanted.extend(super::sparse::lazy_range());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed

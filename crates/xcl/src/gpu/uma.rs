@@ -66,6 +66,34 @@ struct Inner {
     free: BTreeMap<usize, usize>,
     /// live allocations: offset → length
     used: BTreeMap<usize, usize>,
+    /// one bit per `GRAIN` of the block: handed out before (`alloc_where`). Memory never
+    /// handed out is zero as Windows committed it and is not written to make it so: a title
+    /// that takes the whole window at start (a retail game: 3934 MB in one call) had 4 GB
+    /// of zero pages in its working set, all of them dirty for the write watch.
+    ever: Vec<u64>,
+}
+
+impl Inner {
+    /// `[at, at + size)` (multiples of `GRAIN`) is handed out: the parts of it that were
+    /// before, as (offset, length) runs – those may hold what their last owner wrote.
+    fn hand_out(&mut self, at: usize, size: usize) -> Vec<(usize, usize)> {
+        let (first, end) = (at / GRAIN, (at + size) / GRAIN);
+        if self.ever.len() * 64 < end {
+            self.ever.resize(end.div_ceil(64), 0);
+        }
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for g in first..end {
+            let (w, b) = (g / 64, 1u64 << (g % 64));
+            if self.ever[w] & b != 0 {
+                match runs.last_mut() {
+                    Some((o, l)) if *o + *l == g * GRAIN => *l += GRAIN,
+                    _ => runs.push((g * GRAIN, GRAIN)),
+                }
+            }
+            self.ever[w] |= b;
+        }
+        runs
+    }
 }
 
 /// Carve an `align`-aligned block of `size` bytes from `free` within `[lo_bound, hi_bound)`.
@@ -581,6 +609,7 @@ impl Uma {
             g.free.insert(at + size, start + len - at - size);
         }
         g.used.insert(at, size);
+        let again = g.hand_out(at, size);
         let used = if Self::tracing() && size >= 1 << 20 { Some(g.used.values().sum()) } else { None };
         drop(g);
         let p = (self.base + at) as *mut u8;
@@ -588,7 +617,10 @@ impl Uma {
             self.trace(size, Some(p as usize), used);
         }
         if zero {
-            unsafe { std::ptr::write_bytes(p, 0, size) };
+            // only what was handed out before: the rest is zero since it was committed
+            for (o, l) in again {
+                unsafe { std::ptr::write_bytes((self.base + o) as *mut u8, 0, l) };
+            }
         }
         Some(p)
     }
@@ -962,5 +994,24 @@ mod tests {
         assert_eq!(u.sparse_used(), 0);
         // Contiguous sparse windows 0..2 are reported as one OS watch region; window 3 as another.
         assert_eq!(u.watch_regions(), vec![(u.base(), 3 * WINDOW), (u.base() + 3 * WINDOW, 16 << 20)]);
+    }
+
+    /// Memory handed out for the first time is not written (it is zero as committed); memory
+    /// handed out again is zeroed, also when only a part of the block was used before.
+    #[test]
+    fn only_memory_handed_out_before_is_zeroed() {
+        let u = Uma::with_windows(1, 8 << 20).unwrap();
+        let mut g = u.inner.lock().unwrap();
+        assert!(g.hand_out(0, 4 * GRAIN).is_empty(), "never handed out: nothing to zero");
+        assert_eq!(g.hand_out(2 * GRAIN, 4 * GRAIN), vec![(2 * GRAIN, 2 * GRAIN)]);
+        assert_eq!(g.hand_out(0, 8 * GRAIN), vec![(0, 6 * GRAIN)]);
+        drop(g);
+        let u = Uma::with_windows(1, 8 << 20).unwrap();
+        let p = u.alloc(2 * GRAIN, GRAIN).unwrap();
+        unsafe { std::ptr::write_bytes(p, 0xa5, 2 * GRAIN) };
+        assert!(u.free(p as usize));
+        let q = u.alloc(3 * GRAIN, GRAIN).unwrap();
+        assert_eq!(q, p, "first fit: the freed block and what follows it");
+        assert!(unsafe { std::slice::from_raw_parts(q, 3 * GRAIN) }.iter().all(|&b| b == 0));
     }
 }
