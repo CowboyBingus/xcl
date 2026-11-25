@@ -211,6 +211,21 @@ struct RbJob {
     rb_v: u64,
     done_v: u64,
     copies: Vec<(usize, usize, usize)>,
+    /// the fences of its title queue's copy back queue (`State::rb_queues`): the first reaches
+    /// `rb_v` when the lists it follows are done, the second `done_v` when the copy is. None:
+    /// `rb_fence` and the fence of `rbq`
+    fences: Option<(ID3D12Fence, ID3D12Fence)>,
+}
+
+/// The copies back of one title queue (`State::rb_queues`): a fence the title queue signals
+/// after its lists, a queue of XCL's that waits for it and runs the copies, and the fence that
+/// queue signals after them, with the last values.
+struct RbQueue {
+    title: ID3D12Fence,
+    title_v: u64,
+    queue: ID3D12CommandQueue,
+    done: ID3D12Fence,
+    done_v: u64,
 }
 
 /// How far `drain_readbacks` goes
@@ -242,6 +257,14 @@ struct State {
     /// on `queue`, every upload behind it (`before_execute` waiting for ring room).
     rbq: Option<(ID3D12CommandQueue, ID3D12Fence)>,
     rbq_value: u64,
+    /// title queue → its copy back queue and fences (used while `rbq` is there; `rbq` and
+    /// `rb_fence` only when one cannot be made). With one fence for all title queues, a queue that
+    /// got to its Signal first let the copy of a queue still waiting (for work the title submits
+    /// later) run early: it read the bytes before that queue's lists wrote them, landed them, and
+    /// nothing read them again (`Wait64BitValueX timed out … memory holds 0` once the title's
+    /// queues wait for each other). With one copy queue for all, every copy waited behind such a
+    /// queue.
+    rb_queues: FxHashMap<usize, RbQueue>,
     /// submitted copies back, oldest first, and finished ones to reuse
     rb_jobs: VecDeque<RbJob>,
     rb_pool: Vec<RbJob>,
@@ -264,8 +287,13 @@ struct State {
     /// decommits and commits again thousands of tiles a second, and each `UpdateTileMappings`
     /// took ~0.15 ms.)
     parked: FxHashMap<usize, (u32, u32)>,
-    /// placed buffers → the pool tiles they use
-    buffers: FxHashMap<usize, Vec<(u32, u32)>>,
+    /// tile address → pool tile of decommitted tiles a placed buffer uses: they stay mapped in
+    /// their window until the buffer is gone. Memory committed there again is then the same for
+    /// the window (what shaders write) and the buffer (what an ExecuteIndirect or a copy of the
+    /// title reads); with a new tile in the window the buffer kept the old one, with old bytes
+    kept: FxHashMap<usize, (u32, u32)>,
+    /// placed buffers → the tiles they use (address, pool tile)
+    buffers: FxHashMap<usize, Vec<(usize, (u32, u32))>>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
     to_zero: Vec<(usize, usize)>,
     /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped)
@@ -460,7 +488,7 @@ unsafe fn wait_fence(fence: &ID3D12Fence, target: u64) -> bool {
     let event = EVENT.with(|e| *e);
     let start = std::time::Instant::now();
     loop {
-        let at = fence.GetCompletedValue();
+        let at = super::real::fence_completed(fence);
         if at >= target {
             return true;
         }
@@ -488,7 +516,7 @@ unsafe fn wait_released(g: MutexGuard<'static, Option<State>>, value: u64) -> (M
     let Some(fence) = g.as_ref().map(|s| s.fence.clone()) else { return (g, false) };
     drop(g);
     let reached = wait_fence(&fence, value);
-    let g = STATE.lock().unwrap();
+    let g = lock_state();
     let same = g.as_ref().is_some_and(|s| s.fence.as_raw() == fence.as_raw());
     (g, reached && same)
 }
@@ -521,7 +549,7 @@ unsafe fn readback_released(mut g: MutexGuard<'static, Option<State>>, ranges: &
             let Some(s) = g.as_mut() else { return };
             // (a copy given up earlier: its list and the buffer are still in use)
             let last = s.rb_last_fence;
-            if last != 0 && s.fence.GetCompletedValue() < last {
+            if last != 0 && super::real::fence_completed(&s.fence) < last {
                 let (again, there) = wait_released(g, last);
                 g = again;
                 if !there {
@@ -550,7 +578,7 @@ unsafe fn readback_released(mut g: MutexGuard<'static, Option<State>>, ranges: &
 
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
-    let g = STATE.lock().unwrap();
+    let g = lock_state();
     let Some(s) = g.as_ref() else { return (0, 0) };
     let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
     (pools, pools.saturating_sub(s.free.len() * TILE))
@@ -665,6 +693,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         event,
         rb_fence,
         rb_value: 0,
+        rb_queues: FxHashMap::default(),
         rbq,
         rbq_value: 0,
         rb_jobs: VecDeque::new(),
@@ -676,6 +705,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         mapped: FxHashMap::default(),
         pinned: FxHashMap::default(),
         parked: FxHashMap::default(),
+        kept: FxHashMap::default(),
         buffers: FxHashMap::default(),
         to_zero: Vec::new(),
         staging: None,
@@ -707,7 +737,7 @@ const SHADOW_POOL: u32 = u32::MAX;
 /// All of it counts as mapped from the start: the window is committed. False: no queue for
 /// the copies (the buffer then never sees the CPU's writes).
 pub unsafe fn shadow_window(dev: &ID3D12Device, base: usize, size: usize, buf: &ID3D12Resource) -> bool {
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     if g.is_none() {
         // no sparse window was made (`init`): the copies still need the queue and the lists
         match new_state(dev, Vec::new()) {
@@ -833,7 +863,7 @@ impl State {
     /// 0.29 GB of tiles in use). Call after their tiles are unmapped and signalled.
     fn retire_free_pools(&mut self) {
         let now = std::time::Instant::now();
-        let done = unsafe { self.fence.GetCompletedValue() };
+        let done = unsafe { super::real::fence_completed(&self.fence) };
         self.retired.retain(|(_, v, at)| !(done >= *v && now.duration_since(*at).as_secs() >= 2));
         if self.free.len() < POOL_TILES as usize {
             return;
@@ -956,7 +986,7 @@ impl State {
         while t < end {
             if !self.mapped.contains_key(&t) && self.window_index(t).is_some() {
                 // still mapped there: no new mapping, what it held is cleared
-                if let Some(tile) = self.parked.remove(&t) {
+                if let Some(tile) = self.parked.remove(&t).or_else(|| self.kept.remove(&t)) {
                     self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
                     self.runs = None;
                     self.to_zero.push((t, TILE));
@@ -1005,14 +1035,26 @@ impl State {
 
     #[inline]
     unsafe fn wait_for(&self, target: u64) {
-        if target == 0 || self.fence.GetCompletedValue() >= target {
+        if target == 0 || super::real::fence_completed(&self.fence) >= target {
             return;
         }
-        let _ = self.fence.SetEventOnCompletion(target, self.event);
-        windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-        if self.fence.GetCompletedValue() < target {
-            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
+        // The event is one for all waits here, and a wait that gave up leaves its registration
+        // behind: that one sets the event later, and the next wait would return at once with the
+        // queue not there (10 such "after 5 s" lines within 100 ms in one run, each followed by a
+        // Reset of an allocator the GPU was still in). So: until the fence says so, or 5 s.
+        let t0 = std::time::Instant::now();
+        loop {
+            let _ = self.fence.SetEventOnCompletion(target, self.event);
+            let left = 5000u64.saturating_sub(t0.elapsed().as_millis() as u64).max(1) as u32;
+            windows::Win32::System::Threading::WaitForSingleObject(self.event, left);
+            if super::real::fence_completed(&self.fence) >= target {
+                return;
+            }
+            if t0.elapsed().as_millis() >= 5000 {
+                break;
+            }
         }
+        crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", super::real::fence_completed(&self.fence));
     }
 
     #[inline]
@@ -1020,7 +1062,7 @@ impl State {
         if self.inflight.is_empty() {
             return;
         }
-        let completed = self.fence.GetCompletedValue();
+        let completed = super::real::fence_completed(&self.fence);
         while let Some(&(fv, end_pos)) = self.inflight.front() {
             if fv <= completed {
                 self.ring_free = end_pos;
@@ -1041,7 +1083,7 @@ impl State {
             return Ok(0);
         }
         self.reclaim_ring();
-        let completed = self.fence.GetCompletedValue();
+        let completed = super::real::fence_completed(&self.fence);
         for k in 0..self.slots.len().min(2) {
             let fv = self.slots[(self.next_slot + k) % self.slots.len()].fence_val;
             if fv > completed {
@@ -1075,7 +1117,7 @@ impl State {
         let idx = self.next_slot;
         self.next_slot = (self.next_slot + 1) % self.slots.len();
         let fv = self.slots[idx].fence_val;
-        if fv > 0 && self.fence.GetCompletedValue() < fv {
+        if fv > 0 && super::real::fence_completed(&self.fence) < fv {
             self.wait_for(fv);
             self.reclaim_ring();
         }
@@ -1317,26 +1359,43 @@ impl State {
         let buf = r?;
         let mut p: *mut c_void = std::ptr::null_mut();
         buf.Map(0, None, Some(&mut p)).ok()?;
-        Some(RbJob { alloc, list, buf, ptr: p as *mut u8, cap, rb_v: 0, done_v: 0, copies: Vec::new() })
+        Some(RbJob { alloc, list, buf, ptr: p as *mut u8, cap, rb_v: 0, done_v: 0, copies: Vec::new(), fences: None })
     }
 
-    /// Land submitted copies back in the title's memory, oldest first, as far as `how` says.
+    /// The fences a copy back waits on: its title queue's (reaches `rb_v` when the title's lists
+    /// are done) and its copy queue's (reaches `done_v` when the copy is).
+    fn rb_job_fences(&self, j: &RbJob) -> Option<(ID3D12Fence, ID3D12Fence)> {
+        match &j.fences {
+            Some(f) => Some(f.clone()),
+            None => self.rbq.as_ref().map(|(_, done)| (self.rb_fence.clone(), done.clone())),
+        }
+    }
+
+    /// Land submitted copies back in the title's memory as far as `how` says: every one that is
+    /// done, oldest first (one title queue's in its order; a queue that waits does not hold back
+    /// the copies of the others).
     unsafe fn drain_readbacks(&mut self, how: Drain) {
-        let Some((_, done)) = self.rbq.clone() else { return };
-        while let Some((rb_v, done_v)) = self.rb_jobs.front().map(|j| (j.rb_v, j.done_v)) {
-            if done.GetCompletedValue() < done_v {
-                if how == Drain::Finished || self.rb_fence.GetCompletedValue() < rb_v {
-                    break;
+        if self.rbq.is_none() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.rb_jobs.len() {
+            let Some((title, done)) = self.rb_job_fences(&self.rb_jobs[i]) else { return };
+            let (rb_v, done_v) = (self.rb_jobs[i].rb_v, self.rb_jobs[i].done_v);
+            if super::real::fence_completed(&done) < done_v {
+                if how == Drain::Finished || super::real::fence_completed(&title) < rb_v {
+                    i += 1;
+                    continue;
                 }
                 // the title's lists are done: only the copy itself is left
-                let _ = done.SetEventOnCompletion(done_v, self.event);
-                windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-                if done.GetCompletedValue() < done_v {
+                // (`wait_fence`'s own event: `self.event` is the tile queue's, see `wait_for`)
+                if !wait_fence(&done, done_v) {
                     crate::xlog_warn!("sparse: a copy back has not finished 5 s after the title's work it follows");
-                    break;
+                    i += 1;
+                    continue;
                 }
             }
-            let mut job = self.rb_jobs.pop_front().expect("front");
+            let Some(mut job) = self.rb_jobs.remove(i) else { break };
             let copies = std::mem::take(&mut job.copies);
             self.copy_back(job.ptr, &copies);
             RB_PENDING.fetch_sub(1, Ordering::Release);
@@ -1346,10 +1405,32 @@ impl State {
         }
     }
 
-    /// `readback_released` without a CPU wait: the copies run on `rbq`, after the title's queue
-    /// signalled `rb_fence` = `rb_v`, and land in the title's memory in `drain_readbacks`.
-    unsafe fn readback_async(&mut self, ranges: &[(usize, usize)], rb_v: u64) {
-        let Some((q, done)) = self.rbq.clone() else { return };
+    /// The copy back queue of title queue `key` (made the first time) and the value its title
+    /// fence gets next: (copy queue, title fence, value). None: it could not be made.
+    unsafe fn rb_queue_for(&mut self, key: usize) -> Option<(ID3D12CommandQueue, ID3D12Fence, u64)> {
+        if !self.rb_queues.contains_key(&key) {
+            let title: ID3D12Fence = self.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            let done: ID3D12Fence = self.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            let queue: ID3D12CommandQueue = self.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
+            let _ = queue.SetName(windows::core::w!("xcl sparse readback queue"));
+            self.rb_queues.insert(key, RbQueue { title, title_v: 0, queue, done, done_v: 0 });
+        }
+        let rq = self.rb_queues.get_mut(&key)?;
+        rq.title_v += 1;
+        Some((rq.queue.clone(), rq.title.clone(), rq.title_v))
+    }
+
+    /// `readback_released` without a CPU wait: the copies run on the copy queue of title queue
+    /// `key` (None: on `rbq`), after the title's queue signalled its fence (`rb_fence`) = `rb_v`,
+    /// and land in the title's memory in `drain_readbacks`.
+    unsafe fn readback_async(&mut self, ranges: &[(usize, usize)], key: Option<usize>, rb_v: u64) {
+        let (q, title, done) = match key.and_then(|k| self.rb_queues.get(&k)) {
+            Some(rq) => (rq.queue.clone(), Some(rq.title.clone()), rq.done.clone()),
+            None => {
+                let Some((q, done)) = self.rbq.clone() else { return };
+                (q, None, done)
+            }
+        };
         // the mapped parts, in readback-buffer sized batches: (window, address, bytes)
         let mut batches: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new()];
         let mut used = 0usize;
@@ -1395,10 +1476,20 @@ impl State {
                     super::title_textures::own_work(|| q.ExecuteCommandLists(&[Some(l)]));
                 }
             }
-            self.rbq_value += 1;
-            let _ = q.Signal(&done, self.rbq_value);
+            let done_v = match key.and_then(|k| self.rb_queues.get_mut(&k)) {
+                Some(rq) => {
+                    rq.done_v += 1;
+                    rq.done_v
+                }
+                None => {
+                    self.rbq_value += 1;
+                    self.rbq_value
+                }
+            };
+            let _ = q.Signal(&done, done_v);
             job.rb_v = rb_v;
-            job.done_v = self.rbq_value;
+            job.done_v = done_v;
+            job.fences = title.clone().map(|t| (t, done.clone()));
             self.rb_jobs.push_back(job);
             RB_PENDING.fetch_add(1, Ordering::Release);
             RB_ASYNC.store(true, Ordering::Relaxed);
@@ -1555,7 +1646,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     if ranges.is_empty() {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     let merged = s.after_execute(queue, ranges);
     if merged.is_empty() {
@@ -1565,7 +1656,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     // and is waited for with `STATE` released (`READBACK` is taken before `STATE`)
     drop(g);
     let _one = READBACK.lock().unwrap();
-    readback_released(STATE.lock().unwrap(), &merged);
+    readback_released(lock_state(), &merged);
 }
 
 /// copies back submitted and not landed yet, and whether any ran on the readback queue
@@ -1583,7 +1674,7 @@ pub unsafe fn settle_readbacks() {
     if RB_PENDING.load(Ordering::Acquire) == 0 {
         return;
     }
-    settle_released(STATE.lock().unwrap(), true);
+    settle_released(lock_state(), true);
 }
 
 /// `drain_readbacks(Drain::TitleDone)` of the state, the wait for a copy whose title work is
@@ -1595,15 +1686,20 @@ unsafe fn settle_released(mut g: MutexGuard<'static, Option<State>>, patient: bo
     loop {
         let Some(s) = g.as_mut() else { return Some(g) };
         s.drain_readbacks(Drain::Finished);
-        let Some((_, done)) = s.rbq.clone() else { return Some(g) };
-        let Some((rb_v, done_v)) = s.rb_jobs.front().map(|j| (j.rb_v, j.done_v)) else { return Some(g) };
-        if s.rb_fence.GetCompletedValue() < rb_v {
-            return Some(g);
+        // the oldest copy whose title work is done and which is not done itself
+        let mut next = None;
+        for j in &s.rb_jobs {
+            let Some((title, done)) = s.rb_job_fences(j) else { break };
+            if super::real::fence_completed(&title) >= j.rb_v && super::real::fence_completed(&done) < j.done_v {
+                next = Some((done, j.done_v));
+                break;
+            }
         }
+        let Some((done, done_v)) = next else { return Some(g) };
         drop(g);
         // the title's lists are done: only the copy itself is left
         let reached = wait_fence(&done, done_v);
-        g = if patient { STATE.lock().unwrap() } else { try_state()? };
+        g = if patient { lock_state() } else { try_state()? };
         if !reached {
             return Some(g);
         }
@@ -1671,6 +1767,18 @@ impl State {
                 _ => merged.push((a, n)),
             }
         }
+        if s.rbq.is_some() {
+            // this queue's own fence and copy queue (`rb_queues`)
+            let key = queue.as_raw() as usize;
+            if let Some((q, title, v)) = s.rb_queue_for(key) {
+                if queue.Signal(&title, v).is_ok() {
+                    let _ = q.Wait(&title, v);
+                }
+                s.readback_async(&merged, Some(key), v);
+                start_readback_thread();
+                return Vec::new();
+            }
+        }
         s.rb_value += 1;
         let v = s.rb_value;
         let signalled = queue.Signal(&s.rb_fence, v).is_ok();
@@ -1678,7 +1786,7 @@ impl State {
             if signalled {
                 let _ = q.Wait(&s.rb_fence, v);
             }
-            s.readback_async(&merged, v);
+            s.readback_async(&merged, None, v);
             start_readback_thread();
             return Vec::new();
         }
@@ -1699,7 +1807,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         return;
     }
     let _one = READBACK.lock().unwrap();
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     if g.as_ref().is_none_or(|s| s.window_index(va).is_none()) {
         return;
     }
@@ -1756,7 +1864,7 @@ pub unsafe fn committed(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_add(&mut EARLY.lock().unwrap(), start, end);
@@ -1772,7 +1880,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_remove(&mut EARLY.lock().unwrap(), start, end);
@@ -1835,9 +1943,18 @@ impl State {
         }
     }
 
-    /// a pool tile no window maps, none is parked on and no buffer uses goes back to the free list
-    fn release_if_unused(&mut self, tile: (u32, u32)) {
-        if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) && !self.parked.values().any(|&p| p == tile) {
+    /// A pool tile a buffer used at `t` goes back to the free list, unless its window maps it, it
+    /// is parked there, or another buffer uses it. Kept mapped for the buffer: parked from here on.
+    fn release_if_unused(&mut self, t: usize, tile: (u32, u32)) {
+        if self.pinned.contains_key(&tile) {
+            return;
+        }
+        if self.kept.get(&t) == Some(&tile) {
+            self.kept.remove(&t);
+            self.parked.insert(t, tile);
+            return;
+        }
+        if self.mapped.get(&t).is_none_or(|e| e.pool != tile) && self.parked.get(&t) != Some(&tile) {
             self.free.push(tile);
         }
     }
@@ -1851,12 +1968,18 @@ impl State {
         }
         let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
         for (t, tile) in std::mem::take(&mut self.parked) {
+            // (a placed buffer uses it)
+            if self.pinned.contains_key(&tile) {
+                self.kept.insert(t, tile);
+                continue;
+            }
             if let Some(wi) = self.window_index(t) {
                 by_window.entry(wi).or_default().push(t);
             }
-            if !self.pinned.contains_key(&tile) {
-                self.free.push(tile);
-            }
+            self.free.push(tile);
+        }
+        if by_window.is_empty() {
+            return false;
         }
         for (wi, ts) in by_window {
             let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
@@ -1870,7 +1993,7 @@ impl State {
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return Vec::new() };
     if s.runs.is_none() {
         let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
@@ -1904,7 +2027,7 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// lock, the room waited for with it released.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.drain_readbacks(Drain::Finished);
     // the title's work sees what was decommitted unmapped, as it was
@@ -2005,7 +2128,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let s = g.as_mut()?;
     let start = va & !(TILE - 1);
     let delta = va - start;
@@ -2038,22 +2161,52 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
-    s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
+    s.buffers.insert(raw as usize, tiles);
     s.signal();
     Some((hr, delta))
 }
 
-/// A placed buffer is gone: its tiles are not pinned by it any more.
-pub fn forget_buffer(res: usize) {
+/// Placed buffers released while `STATE` was held, let go by the next `lock_state`. Held only
+/// to push or take, never across a call out.
+static FORGOTTEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// `STATE`, with the buffers released while it was held let go first.
+fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
     let mut g = STATE.lock().unwrap();
+    forget_released(&mut g);
+    g
+}
+
+fn forget_released(g: &mut Option<State>) {
+    let gone = std::mem::take(&mut *FORGOTTEN.lock().unwrap());
     let Some(s) = g.as_mut() else { return };
+    for res in gone {
+        forget_in(s, res);
+    }
+}
+
+/// A placed buffer is gone: its tiles are not pinned by it any more. This runs from the
+/// resource's last Release, which D3D12 can make while it holds a lock of its own (in a title's
+/// command list Reset), and `before_execute` calls D3D12 with `STATE` held: waiting for `STATE`
+/// here deadlocked the two threads. So it does not wait: with `STATE` held, the holder's next
+/// `lock_state` lets the buffer go.
+pub fn forget_buffer(res: usize) {
+    FORGOTTEN.lock().unwrap().push(res);
+    match STATE.try_lock() {
+        Ok(mut g) => forget_released(&mut g),
+        Err(std::sync::TryLockError::WouldBlock) => {}
+        Err(e) => panic!("sparse state: {e}"),
+    }
+}
+
+fn forget_in(s: &mut State, res: usize) {
     let Some(tiles) = s.buffers.remove(&res) else { return };
-    for tile in tiles {
+    for (t, tile) in tiles {
         if let Some(c) = s.pinned.get_mut(&tile) {
             *c -= 1;
             if *c == 0 {
                 s.pinned.remove(&tile);
-                s.release_if_unused(tile);
+                s.release_if_unused(t, tile);
             }
         }
     }
@@ -2062,6 +2215,39 @@ pub fn forget_buffer(res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `f` on another thread while this one holds the sparse state (as `before_execute` does
+    /// around its D3D12 calls, which can wait for that thread): did `f` finish without waiting
+    /// for the state? The thread runs before the state is taken, so its start is not timed.
+    fn returns_while_the_state_is_held(f: impl FnOnce() + Send + 'static) -> bool {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let _ = go_rx.recv();
+            f();
+            let _ = tx.send(());
+        });
+        ready_rx.recv().unwrap();
+        let held = STATE.lock().unwrap();
+        go_tx.send(()).unwrap();
+        let done = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(held);
+        let joined = t.join();
+        assert!(joined.is_ok(), "the thread panicked: {joined:?}");
+        done.is_ok()
+    }
+
+    /// A placed buffer released while another thread holds the sparse state: the release does
+    /// not wait for the state, and the next `lock_state` lets the buffer go.
+    #[test]
+    fn a_buffer_released_while_the_state_is_held_does_not_wait_for_it() {
+        const RES: usize = 0x7ff0_dead_0000;
+        assert!(returns_while_the_state_is_held(|| forget_buffer(RES)), "forget_buffer waited for the sparse state's lock");
+        drop(lock_state());
+        assert!(!FORGOTTEN.lock().unwrap().contains(&RES));
+    }
 
     /// A copy back after a title submission does not wait for the title's queue: that queue can
     /// be waiting for work the title submits next, from the thread that is in here. The copy
@@ -2104,6 +2290,7 @@ mod tests {
                 event,
                 rb_fence,
                 rb_value: 0,
+                rb_queues: FxHashMap::default(),
                 rbq: Some((rbq_queue, rbq_fence)),
                 rbq_value: 0,
                 rb_jobs: VecDeque::new(),
@@ -2115,6 +2302,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                kept: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
@@ -2135,14 +2323,14 @@ mod tests {
             };
             s.commit_range(base, TILE);
             assert!(s.mapped.contains_key(&base));
-            std::ptr::write_bytes(base as *mut u8, 0, 256);
+            std::ptr::write_bytes(base as *mut u8, 0, 512);
 
             // the title's queue: blocked on a fence nothing has signalled yet, then a copy of
             // 0..64 into the tile (a GPU write the title's next CPU read expects)
             let title: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
             let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate");
             let mut up: Option<ID3D12Resource> = None;
-            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &{ let mut d = buffer_desc(256); d.Flags = D3D12_RESOURCE_FLAG_NONE; d }, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up)
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &{ let mut d = buffer_desc(512); d.Flags = D3D12_RESOURCE_FLAG_NONE; d }, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up)
                 .expect("upload buffer");
             let up = up.expect("upload buffer");
             let mut p: *mut c_void = std::ptr::null_mut();
@@ -2162,22 +2350,48 @@ mod tests {
             s.after_execute(&title, &[(base, 256)]);
             let took = t0.elapsed();
             assert!(took < std::time::Duration::from_secs(1), "the copy back waited {took:?} for the title's queue");
+            // the title's own fence after that submission
+            let own: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("own fence");
+            title.Signal(&own, 1).expect("own signal");
             s.drain_readbacks(Drain::Finished);
             assert_eq!(*(base as *const u32), 0, "nothing lands before the title's work is done");
 
+            // another title queue that does not wait writes 256..512 and gets there first: its copy
+            // lands, the blocked queue's copy neither runs early (it would read the bytes before
+            // its list wrote them and land those) nor holds this one back
+            let other: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("other title queue");
+            for i in 0..64u32 {
+                *(p as *mut u32).add(64 + i as usize) = 0xB0B0_0000 | i;
+            }
+            let alloc2: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
+            let list2: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc2, None).expect("list");
+            list2.CopyBufferRegion(&reserved, 256, &up, 256, 256);
+            list2.Close().expect("close");
+            other.Wait(&s.fence, s.value).expect("wait for the tile mapping");
+            other.ExecuteCommandLists(&[Some(list2.cast::<ID3D12CommandList>().unwrap())]);
+            s.after_execute(&other, &[(base + 256, 256)]);
+            let own2: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("own fence");
+            other.Signal(&own2, 1).expect("own signal");
+            own2.SetEventOnCompletion(1, s.event).expect("SetEventOnCompletion");
+            windows::Win32::System::Threading::WaitForSingleObject(s.event, 5000);
+            s.drain_readbacks(Drain::TitleDone);
+            for i in 0..64u32 {
+                assert_eq!(*(base as *const u32).add(64 + i as usize), 0xB0B0_0000 | i, "dword {} of the other queue's copy back", 64 + i);
+            }
+            assert_eq!(s.rb_jobs.len(), 1, "the blocked queue's copy back is still to come");
+            assert_eq!(*(base as *const u32), 0, "nothing of the blocked queue lands before its work is done");
+
             // the title's queue goes on: the copy back lands once it is done
             gate.Signal(1).expect("gate signal");
-            // as the title would: wait for its own work (here the fence its queue signalled)
-            if s.rb_fence.GetCompletedValue() < s.rb_value {
-                s.rb_fence.SetEventOnCompletion(s.rb_value, s.event).expect("SetEventOnCompletion");
-                windows::Win32::System::Threading::WaitForSingleObject(s.event, 5000);
-            }
+            // as the title would: wait for its own work
+            own.SetEventOnCompletion(1, s.event).expect("SetEventOnCompletion");
+            windows::Win32::System::Threading::WaitForSingleObject(s.event, 5000);
             s.drain_readbacks(Drain::TitleDone);
             for i in 0..64u32 {
                 assert_eq!(*(base as *const u32).add(i as usize), 0xC0DE_0000 | i, "dword {i} after the copy back");
             }
-            assert!(s.rb_jobs.is_empty(), "the copy back was consumed");
-            assert_eq!(s.rb_pool.len(), 1, "its buffer is kept for the next one");
+            assert!(s.rb_jobs.is_empty(), "the copy backs were consumed");
+            assert_eq!(s.rb_pool.len(), 2, "their buffers are kept for the next ones");
             drop(s);
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
@@ -2256,6 +2470,7 @@ mod tests {
                 event,
                 rb_fence,
                 rb_value: 0,
+                rb_queues: FxHashMap::default(),
                 rbq: None,
                 rbq_value: 0,
                 rb_jobs: VecDeque::new(),
@@ -2265,6 +2480,7 @@ mod tests {
                 free: Vec::new(),
                 retired: Vec::new(),
                 parked: FxHashMap::default(),
+                kept: FxHashMap::default(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 buffers: FxHashMap::default(),
@@ -2466,6 +2682,7 @@ mod tests {
                 event,
                 rb_fence,
                 rb_value: 0,
+                rb_queues: FxHashMap::default(),
                 rbq: None,
                 rbq_value: 0,
                 rb_jobs: VecDeque::new(),
@@ -2477,6 +2694,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                kept: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
@@ -2568,6 +2786,7 @@ mod tests {
                 event,
                 rb_fence,
                 rb_value: 0,
+                rb_queues: FxHashMap::default(),
                 rbq: None,
                 rbq_value: 0,
                 rb_jobs: VecDeque::new(),
@@ -2579,6 +2798,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                kept: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
@@ -2609,7 +2829,7 @@ mod tests {
             assert_eq!(s.parked.get(&base), Some(&tile));
             assert!(!s.free.contains(&tile));
             assert_eq!(s.value, v, "no tile mapping changed");
-            s.release_if_unused(tile);
+            s.release_if_unused(base, tile);
             assert!(!s.free.contains(&tile), "a parked tile is not free");
 
             // committed again: the same tile, cleared, no new mapping
@@ -2640,6 +2860,29 @@ mod tests {
             assert!(s.parked.is_empty());
             assert_eq!(s.mapped[&(base + TILE)].pool, tile);
             assert!(!s.mapped.contains_key(&base));
+
+            // a placed buffer uses the tile: the window keeps it when it is decommitted and
+            // flushed, memory committed there again is the buffer's, and it is free only once
+            // the buffer is gone and it was decommitted
+            *s.pinned.entry(tile).or_default() += 1;
+            let at = base + TILE;
+            s.decommit_range(at, TILE);
+            assert!(!s.flush_parked(), "nothing to unmap");
+            assert_eq!(s.kept.get(&at), Some(&tile));
+            assert!(!s.free.contains(&tile));
+            let v = s.value;
+            s.to_zero.clear();
+            s.commit_range(at, TILE);
+            assert_eq!(s.mapped[&at].pool, tile, "the buffer's tile");
+            assert_eq!(s.to_zero, vec![(at, TILE)]);
+            assert_eq!(s.value, v, "no tile mapping changed");
+            s.decommit_range(at, TILE);
+            assert!(!s.flush_parked());
+            s.pinned.remove(&tile);
+            s.release_if_unused(at, tile);
+            assert!(s.kept.is_empty() && !s.free.contains(&tile));
+            assert!(s.flush_parked());
+            assert!(s.free.contains(&tile));
 
             s.wait_for(s.value);
             drop(s);

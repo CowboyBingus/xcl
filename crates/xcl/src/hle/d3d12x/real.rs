@@ -6042,9 +6042,10 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
-    // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
+    // (lists may still hold recordings on it that the title submits again: `alloc_pool`, which
+    // also gives back what recordings on its PC allocators used once the GPU is done with them)
     let hr = match super::alloc_pool::title_reset(this) {
-        Some(hr) => hr,
+        Some(hr) => return hr,
         None => reset_pc_allocator(this),
     };
     if hr >= 0 {
@@ -6276,6 +6277,22 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
     }
     hr
+}
+
+/// GetCompletedValue of `fence` as the PC has it, without what the hook below does for the title
+/// on the way (it lands copies back, which takes the sparse state's lock): for XCL's own queries,
+/// the ones made with that lock held above all. With the hook, each such query stood ~2 ms
+/// trying for the lock its own thread held, and a pass over the pending copies took seconds
+/// with every submitting thread behind it.
+pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
+    const PC_GET_COMPLETED_VALUE: usize = 8;
+    let p = fence.as_raw();
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = if is_adopted(p) {
+        std::mem::transmute(orig_fn(p, slot_of(p, "GetCompletedValue")))
+    } else {
+        std::mem::transmute(*(*(p as *const *const usize)).add(PC_GET_COMPLETED_VALUE))
+    };
+    f(p)
 }
 
 /// Fence::GetCompletedValue. What the title's lists wrote into its sparse memory comes back

@@ -817,6 +817,7 @@ pub(super) fn on_release(list: usize) {
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
+    super::alloc_pool::forget_list(list);
     super::title_textures::list_reset(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
@@ -1142,7 +1143,7 @@ fn queue_id(q: usize) -> usize {
 /// was removed). Returns the fence's current completed value (or `0` if no fence exists yet).
 unsafe fn prune_completed_waits(cell: &mut SyncCell) -> u64 {
     let Some(ref fence) = cell.fence else { return 0 };
-    let completed = fence.GetCompletedValue();
+    let completed = super::real::fence_completed(&fence);
     if completed == u64::MAX {
         let removed = cell.armed_waits.len();
         cell.armed_waits.clear();
@@ -1173,7 +1174,7 @@ unsafe fn prune_title_fence(fence_raw: usize, tf: &mut TitleFenceSync) {
     }
     let p = fence_raw as *mut c_void;
     let Some(f) = ID3D12Fence::from_raw_borrowed(&p) else { return };
-    let completed = f.GetCompletedValue();
+    let completed = super::real::fence_completed(&f);
     if completed == u64::MAX {
         tf.waits.clear();
         tf.signals.clear();
@@ -1201,7 +1202,15 @@ unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_v
         if completed == u64::MAX || target.armed_waits.is_empty() {
             return false;
         }
-        target.armed_waits.iter().filter(|aw| aw.val <= sig_val).map(|aw| (aw.waiting_queue, aw.wait_seq)).collect()
+        // A wait an earlier signal of this cell already satisfies (GPU or CPU) does not wait on
+        // this one: counting it made every pipelined frame (wait N armed, signal N+1 next) a cycle.
+        let covered = target.submitted_max.max(target.cpu_signaled_max);
+        target
+            .armed_waits
+            .iter()
+            .filter(|aw| aw.val <= sig_val && aw.val > covered)
+            .map(|aw| (aw.waiting_queue, aw.wait_seq))
+            .collect()
     };
     if target_waiters.is_empty() {
         return false;
@@ -1307,7 +1316,10 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         let Some(graph) = g.as_mut() else { return };
         let Some(tf) = graph.title_fences.get_mut(&title_fence) else { return };
         prune_title_fence(title_fence, tf);
-        let target_waiters: Vec<(usize, u64)> = tf.waits.iter().filter(|&&(v, _, _)| v <= sig_val).map(|&(_, wq, wseq)| (wq, wseq)).collect();
+        // (a wait an earlier signal of the fence satisfies does not wait on this one, as for the
+        // cells in `would_signal_close_cycle`)
+        let covered = tf.signals.iter().map(|s| s.val).max().unwrap_or(0);
+        let target_waiters: Vec<(usize, u64)> = tf.waits.iter().filter(|&&(v, _, _)| v <= sig_val && v > covered).map(|&(_, wq, wseq)| (wq, wseq)).collect();
         if target_waiters.is_empty() {
             return;
         }
@@ -1830,7 +1842,26 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
                         }
                         return GpuWaitOutcome::Handled;
                     }
-                    return if w.is_satisfied() { GpuWaitOutcome::Handled } else { GpuWaitOutcome::FallbackCpu };
+                    if w.is_satisfied() {
+                        return GpuWaitOutcome::Handled;
+                    }
+                    // Without the switch: trusted too if a later value is recorded here (a counter,
+                    // not a flag the title resets and writes again): the producer's lists are done
+                    // on the GPU, and memory the GPU has a copy of (shadowed / sparse windows) gets
+                    // their write only with its copy back.
+                    if cell.recorded_max > w.value {
+                        static STALE: AtomicU64 = AtomicU64::new(0);
+                        if once(&STALE, 16) {
+                            crate::xlog_warn!(
+                                "D3D12.X: Wait64BitValueX at {:#x} >= {:#x}: its producer is done on the GPU (fence {completed:#x}) but memory holds {:x?} – met by the fence",
+                                w.va,
+                                w.value,
+                                w.read_value()
+                            );
+                        }
+                        return GpuWaitOutcome::Handled;
+                    }
+                    return GpuWaitOutcome::FallbackCpu;
                 }
                 if cell.submitted_max >= w.value && cell.submitted_queue == Some(q_raw) {
                     return GpuWaitOutcome::Handled;
@@ -1884,6 +1915,28 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
     GpuWaitOutcome::Handled
 }
 
+/// `w.wait_until_satisfied(timeout)` that hands the wait to the GPU as soon as `try_gpu_wait`
+/// can: its producer, not recorded yet when the wait began (what made it a CPU wait), recorded
+/// meanwhile on another thread. Waiting on here held this thread's submission for the whole
+/// timeout whenever that producer's queue waits in turn for work this thread submits next.
+/// True: met, or bridged to the GPU.
+unsafe fn wait_or_bridge(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64, u64)], timeout: Duration) -> bool {
+    const SLICE: Duration = Duration::from_millis(20);
+    let start = Instant::now();
+    loop {
+        let left = timeout.saturating_sub(start.elapsed());
+        if w.wait_until_satisfied(left.min(SLICE)) {
+            return true;
+        }
+        if left <= SLICE {
+            return false;
+        }
+        if !queue.is_null() && try_gpu_wait(queue, w, list_writes) != GpuWaitOutcome::FallbackCpu {
+            return true;
+        }
+    }
+}
+
 unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)]) {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
     static RING_DUMPED: AtomicU64 = AtomicU64::new(0);
@@ -1897,7 +1950,7 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
             GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
             GpuWaitOutcome::FallbackCpu => {}
         }
-        if !w.wait_until_satisfied(timeout) && once(&TIMEOUTS, 40) {
+        if !wait_or_bridge(queue, w, list_writes, timeout) && once(&TIMEOUTS, 40) {
             let cell_diag = {
                 let g = SYNC_GRAPH.lock().unwrap();
                 g.as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| (c.recorded_max, c.submitted_max, c.non_monotonic, c.recorded_list_type.map(|t| t.0)))
@@ -2069,7 +2122,7 @@ struct CopyScratch {
 
 impl CopyScratch {
     fn idle(&mut self) -> bool {
-        self.marks.retain(|_, (fence, value)| unsafe { fence.GetCompletedValue() < *value });
+        self.marks.retain(|_, (fence, value)| unsafe { super::real::fence_completed(&fence) < *value });
         !self.untracked_submission && self.marks.is_empty()
     }
 }
@@ -2534,9 +2587,12 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     let dev_raw = dev.as_raw() as usize;
 
     let mut next_pc: Option<*mut c_void> = None;
+    // the PC allocator the next segment records on
+    let mut on = super::alloc_pool::current(alloc);
     if let Some(spare) = super::title_list::pop_spare(wrapper) {
         let ext_spare = *(spare as *const usize);
         let reset_hr = super::alloc_pool::reset_list(spare as usize, alloc, ty.0, |pc_alloc| {
+            on = pc_alloc;
             pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso)
         });
         real::preserve_vtable(spare, ext_spare);
@@ -2547,7 +2603,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     }
     let next_pc = match next_pc {
         Some(p) => p,
-        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
+        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, on, init_pso) {
             Some(p) => p,
             None => {
                 static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
@@ -2598,7 +2654,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     };
     drop(old_next);
     super::title_textures::list_reset(next_pc as usize);
-    super::bind::inherit_for_split(list, next_pc, alloc);
+    super::bind::inherit_for_split(list, next_pc, on);
     restore_bindings(next_pc, &bindings, ty);
 
     if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
@@ -3076,7 +3132,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                 (Vec::new(), None, Bindings::default())
             }
         };
-        super::bind::inherit_for_split(this, primary, alloc);
+        // (`primary` records on the PC allocator the title's allocator stands for: its Reset below)
+        super::bind::inherit_for_split(this, primary, super::alloc_pool::current(alloc));
         for seg in reclaimed {
             super::bind::reset(seg as *mut c_void, 0, 0);
             clear_segment_state(seg);
@@ -3681,7 +3738,9 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     let resolved = super::pso_async::resolve_for_bind(pso);
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
+    let mut on = alloc;
     let hr = super::alloc_pool::reset_list(this as usize, alloc, ty, |pc_alloc| {
+        on = pc_alloc;
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved)
     });
     real::preserve_vtable(this, ext);
@@ -3713,7 +3772,8 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::title_textures::list_reset(this as usize);
-    super::bind::reset(this, alloc, pso);
+    // (what the new recording puts in unified memory belongs to the PC allocator it is on)
+    super::bind::reset(this, on, pso);
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
@@ -4346,6 +4406,49 @@ mod tests {
         }
         assert_eq!(failed_backing, Some(0x111), "failed Reset must keep holding the old recording's allocator");
         assert_eq!(successful_backing, Some(0x333), "only successful Reset moves the recording to its new allocator");
+    }
+
+    unsafe extern "system" fn reset_ok_native(_this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
+        0
+    }
+
+    /// A list reset on a title allocator that stands for another PC allocator (`alloc_pool`)
+    /// records on that one, and what the recording puts in unified memory is held for it after
+    /// the next Reset – not for the title's allocator, whose own submits the GPU may have passed
+    /// while this one's still run (#1358).
+    #[test]
+    fn a_recordings_memory_is_held_for_the_pc_allocator_it_is_on() {
+        let mut native = vec![0usize; PC_RESET + 1];
+        native[PC_RESET] = reset_ok_native as usize;
+        let extended = [native.as_ptr() as usize, 0usize];
+        let ext = unsafe { extended.as_ptr().add(1) as usize };
+        let mut object = [ext];
+        let list = object.as_mut_ptr() as *mut c_void;
+        let key = list as usize;
+        let ids = Box::new([0u8; 4]);
+        let title = ids.as_ptr() as usize;
+        let (pc, other, block) = (title + 1, title + 2, title + 3);
+        super::super::alloc_pool::stand_in_for_test(title, pc);
+        unsafe { on_create(list, title, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+
+        assert_eq!(unsafe { reset_x(list, title, 0) }, 0);
+        let recording_on = super::super::bind::reset_state_for_test(list).0;
+        super::super::bind::seed_reset_state_for_test(list, recording_on, 0, vec![block]);
+        assert_eq!(unsafe { reset_x(list, other, 0) }, 0);
+        let held_for_pc = super::super::console_list::take_pending_for_test(pc);
+        let held_for_title = super::super::console_list::take_pending_for_test(title);
+
+        LISTS.lock().unwrap().as_mut().unwrap().remove(&key);
+        super::super::bind::remove_state_for_test(list);
+        super::super::alloc_pool::stand_in_for_test(title, title);
+        unsafe {
+            super::super::alloc_pool::forget(title);
+            super::super::alloc_pool::forget(pc);
+            super::super::alloc_pool::forget(other);
+        }
+        assert_eq!(recording_on, pc, "the recording is on the PC allocator the title's allocator stands for");
+        assert_eq!(held_for_pc, vec![block]);
+        assert!(held_for_title.is_empty());
     }
 
     #[test]
@@ -5941,6 +6044,123 @@ mod tests {
                 !would_signal_close_cycle(&mut g3, 0xD001, 0x3000, 0x78d),
                 "pipelined 3-queue chain with wait_seq > sig_seq must NOT be treated as a cycle"
             );
+
+            // 3. Next frame's signal on a cell whose armed wait an earlier signal already covers
+            //    (a retail title, frame 0x6dc): C (0xC001) signalled A=0x6db, Direct (0xD001)
+            //    waits A >= 0x6db (seq 3544) and later signals B=0x6dc (seq 3572); C waits on
+            //    B >= 0x6dc (seq 34) and now signals A=0x6dc. Direct's wait is satisfied by C's
+            //    0x6db signal, not by this one: no cycle.
+            let fa: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let fb: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut gp = SyncGraph::default();
+            gp.cells.insert(
+                0x4000,
+                SyncCell {
+                    fence: Some(fa),
+                    device: dev.as_raw() as usize,
+                    recorded_max: 0x6dc,
+                    submitted_max: 0x6db,
+                    submitted_queue: Some(0xC001),
+                    armed_waits: vec![ArmedGpuWait {
+                        val: 0x6db,
+                        waiting_queue: 0xD001,
+                        waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+                        wait_seq: 3544,
+                        armed_at: Instant::now(),
+                        after_write64: false,
+                    }],
+                    submitted_signals: vec![SubmittedSignal { val: 0x6db, queue: 0xC001, seq: 16 }],
+                    ..Default::default()
+                },
+            );
+            gp.cells.insert(
+                0x5000,
+                SyncCell {
+                    fence: Some(fb),
+                    device: dev.as_raw() as usize,
+                    recorded_max: 0x6dc,
+                    submitted_max: 0x6dc,
+                    submitted_queue: Some(0xD001),
+                    armed_waits: vec![ArmedGpuWait {
+                        val: 0x6dc,
+                        waiting_queue: 0xC001,
+                        waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_COMPUTE.0,
+                        wait_seq: 34,
+                        armed_at: Instant::now(),
+                        after_write64: false,
+                    }],
+                    submitted_signals: vec![SubmittedSignal { val: 0x6dc, queue: 0xD001, seq: 3572 }],
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !would_signal_close_cycle(&mut gp, 0xC001, 0x4000, 0x6dc),
+                "a wait an earlier signal already satisfies must NOT make the next frame's signal a cycle"
+            );
+            // Direct waiting on A >= 0x6dc instead (only this signal satisfies it): a true cycle.
+            gp.cells.get_mut(&0x4000).unwrap().armed_waits[0].val = 0x6dc;
+            assert!(
+                would_signal_close_cycle(&mut gp, 0xC001, 0x4000, 0x6dc),
+                "a wait only this signal satisfies, armed before the waiter's own signal, MUST be a cycle"
+            );
+        }
+    }
+
+    /// The next frame's Signal of a title fence does not break a "cycle" through a wait an earlier
+    /// signal of that fence satisfies; one that only the new signal satisfies is a cycle, broken
+    /// by releasing the cell's wait.
+    #[test]
+    fn a_title_fence_wait_an_earlier_signal_covers_is_no_cycle() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let title: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let cell: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (q0, q1, va, f) = (0xC0F0usize, 0xC0F1usize, 0x7E57_C0F0u64, title.as_raw() as usize);
+            // q1 signalled the fence at 1; q0 waits for that and signals the cell later, which q1
+            // waits for; q1 is about to signal the fence at 2
+            let set = |wait: u64| {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let gr = g.get_or_insert_with(SyncGraph::default);
+                let mut tf = TitleFenceSync::default();
+                tf.waits.push((wait, q0, 5));
+                tf.signals.push(SubmittedSignal { val: 1, queue: q1, seq: 3 });
+                gr.title_fences.insert(f, tf);
+                if !gr.cells.contains_key(&va) {
+                    ARMED_GPU_WAITS.fetch_add(1, Ordering::AcqRel);
+                    gr.cells.insert(
+                        va,
+                        SyncCell {
+                            fence: Some(cell.clone()),
+                            device: dev.as_raw() as usize,
+                            recorded_max: 9,
+                            submitted_max: 9,
+                            submitted_queue: Some(q0),
+                            armed_waits: vec![ArmedGpuWait { val: 9, waiting_queue: q1, waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_COMPUTE.0, wait_seq: 4, armed_at: Instant::now(), after_write64: false }],
+                            submitted_signals: vec![SubmittedSignal { val: 9, queue: q0, seq: 7 }],
+                            ..Default::default()
+                        },
+                    );
+                }
+            };
+            set(1);
+            break_cycles_before_title_signal(q1, f, 2);
+            assert_eq!(cell.GetCompletedValue(), 0, "the wait is the earlier signal's: nothing is released");
+            set(2);
+            break_cycles_before_title_signal(q1, f, 2);
+            assert_eq!(cell.GetCompletedValue(), 9, "a wait only the new signal satisfies: released");
+            let mut g = SYNC_GRAPH.lock().unwrap();
+            let gr = g.as_mut().unwrap();
+            gr.title_fences.remove(&f);
+            let left = gr.cells.remove(&va).map_or(0, |c| c.armed_waits.len());
+            if left > 0 {
+                ARMED_GPU_WAITS.fetch_sub(left, Ordering::AcqRel);
+            }
         }
     }
 
