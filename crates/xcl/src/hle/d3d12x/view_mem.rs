@@ -168,8 +168,19 @@ fn source(va: usize) -> Option<usize> {
     crate::gpu::shader::readable(a, TILE).then_some(a)
 }
 
-/// A sampled signature of a page (a word every 256 bytes and its last one).
-unsafe fn signature(a: usize) -> u64 {
+/// A sampled signature of a page (a word every 256 bytes and its last one), read from a copy
+/// made without faulting: the title may decommit the page meanwhile (a run ended in memcpy here).
+unsafe fn signature(src: usize) -> u64 {
+    thread_local!(static COPY: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; TILE]));
+    COPY.with(|c| {
+        let mut c = c.borrow_mut();
+        c.fill(0);
+        super::title_textures::copy_committed_region(src, c.as_mut_ptr(), TILE);
+        signature_of(c.as_ptr() as usize)
+    })
+}
+
+unsafe fn signature_of(a: usize) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let mut o = 0;
     while o < TILE {
@@ -328,7 +339,8 @@ pub unsafe fn ensure(va: usize, len: usize) {
             if !s.tiles.contains_key(&tile) {
                 continue;
             }
-            std::ptr::copy_nonoverlapping(src as *const u8, s.staging_at.add(i * TILE), TILE);
+            std::ptr::write_bytes(s.staging_at.add(i * TILE), 0, TILE);
+            super::title_textures::copy_committed_region(src, s.staging_at.add(i * TILE), TILE);
             let k = (tile - s.base) / WINDOW - FIRST;
             s.list.CopyBufferRegion(&s.windows[k], ((tile - s.base) % WINDOW) as u64, &s.staging, (i * TILE) as u64, TILE as u64);
         }
