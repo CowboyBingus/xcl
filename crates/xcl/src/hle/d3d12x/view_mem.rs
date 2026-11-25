@@ -32,6 +32,8 @@ const STAGING_TILES: usize = 128;
 struct Tile {
     sig: u64,
     checked: std::time::Instant,
+    /// (pool heap, tile in it)
+    slot: (u32, u32),
 }
 
 struct State {
@@ -47,6 +49,9 @@ struct State {
     base: usize,
     pools: Vec<ID3D12Heap>,
     next: u32,
+    /// pool tiles given back by `evict_stale`
+    free: Vec<(u32, u32)>,
+    evicted_at: Option<std::time::Instant>,
     tiles: HashMap<usize, Tile>,
     staging: ID3D12Resource,
     staging_at: *mut u8,
@@ -64,6 +69,7 @@ static FULL: AtomicU64 = AtomicU64::new(0);
 /// tiles and pools of the state, for `stats` (which must not wait for an `ensure` in progress)
 static TILES: AtomicU64 = AtomicU64::new(0);
 static POOLS: AtomicU64 = AtomicU64::new(0);
+static EVICTED: AtomicU64 = AtomicU64::new(0);
 
 fn buffer_desc(bytes: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
     D3D12_RESOURCE_DESC {
@@ -126,6 +132,8 @@ pub unsafe fn init(dev: &ID3D12Device, base: usize) -> Vec<(usize, usize)> {
             base,
             pools: Vec::new(),
             next: POOL_TILES,
+            free: Vec::new(),
+            evicted_at: None,
             tiles: HashMap::new(),
             staging,
             staging_at: p as *mut u8,
@@ -169,6 +177,33 @@ unsafe fn signature(a: usize) -> u64 {
         o += 256;
     }
     h ^ ((a + TILE - 8) as *const u64).read_unaligned()
+}
+
+/// The pool is full: tiles no draw has named for `STALE` give their pool tiles back (at most
+/// one round a second). A list recorded earlier and not run yet reads 0 or newer bytes there.
+unsafe fn evict_stale(s: &mut State, now: std::time::Instant) {
+    const STALE: std::time::Duration = std::time::Duration::from_secs(6);
+    if s.evicted_at.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1)) {
+        return;
+    }
+    s.evicted_at = Some(now);
+    let old: Vec<usize> = s.tiles.iter().filter(|(_, t)| t.slot.0 != u32::MAX && now.duration_since(t.checked) >= STALE).map(|(&a, _)| a).collect();
+    for &tile in &old {
+        let Some(t) = s.tiles.remove(&tile) else { continue };
+        let k = (tile - s.base) / WINDOW - FIRST;
+        let coord = D3D12_TILED_RESOURCE_COORDINATE { X: ((tile - s.base) % WINDOW / TILE) as u32, ..Default::default() };
+        let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
+        let (flag, count) = (D3D12_TILE_RANGE_FLAG_NULL, 1u32);
+        s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), None, 1, Some(&flag), None, Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+        s.free.push(t.slot);
+    }
+    s.recent.clear();
+    EVICTED.fetch_add(old.len() as u64, Ordering::Relaxed);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: view memory: the pool is full – {} tiles not named for {} s given back ({} kept; round {n})", old.len(), STALE.as_secs(), s.tiles.len());
+    }
 }
 
 /// Shaders may read `[va, va + len)`: the tiles there hold the title's bytes when this returns.
@@ -224,12 +259,15 @@ pub unsafe fn ensure(va: usize, len: usize) {
             }
             None => {
                 if s.tiles.len() >= s.cap_tiles {
+                    evict_stale(s, now);
+                }
+                if s.tiles.len() >= s.cap_tiles {
                     if FULL.fetch_add(1, Ordering::Relaxed) == 0 {
                         crate::xlog_warn!("D3D12.X: view memory: the pool is full ({} MB, XCL_VIEW_POOL_MB) – further ranges read 0", s.cap_tiles >> 4);
                     }
                     continue;
                 }
-                s.tiles.insert(tile, Tile { sig, checked: now });
+                s.tiles.insert(tile, Tile { sig, checked: now, slot: (u32::MAX, 0) });
                 todo.push((tile, src, true));
             }
         }
@@ -241,6 +279,17 @@ pub unsafe fn ensure(va: usize, len: usize) {
     // new tiles: a pool tile each, mapped under the window
     for &(tile, _, new) in &todo {
         if !new {
+            continue;
+        }
+        if let Some(slot) = s.free.pop() {
+            let k = (tile - s.base) / WINDOW - FIRST;
+            let coord = D3D12_TILED_RESOURCE_COORDINATE { X: ((tile - s.base) % WINDOW / TILE) as u32, ..Default::default() };
+            let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
+            let (flag, offset, count) = (D3D12_TILE_RANGE_FLAG_NONE, slot.1, 1u32);
+            s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), &s.pools[slot.0 as usize], 1, Some(&flag), Some(&offset), Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+            if let Some(t) = s.tiles.get_mut(&tile) {
+                t.slot = slot;
+            }
             continue;
         }
         if s.next >= POOL_TILES {
@@ -266,6 +315,9 @@ pub unsafe fn ensure(va: usize, len: usize) {
         let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
         let (flag, offset, count) = (D3D12_TILE_RANGE_FLAG_NONE, s.next, 1u32);
         s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), s.pools.last().unwrap(), 1, Some(&flag), Some(&offset), Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+        if let Some(t) = s.tiles.get_mut(&tile) {
+            t.slot = (s.pools.len() as u32 - 1, s.next);
+        }
         s.next += 1;
     }
     for batch in todo.chunks(STAGING_TILES) {
@@ -354,8 +406,9 @@ pub unsafe fn ensure_for_draw(layout: Option<&super::console_list::Layout>, args
 pub fn stats() -> String {
     let (tiles, pools) = (TILES.load(Ordering::Relaxed), POOLS.load(Ordering::Relaxed));
     format!(
-        "view memory: {} MB in {tiles} tiles ({pools} pools), {} tile uploads, {} tile checks, {} without a source",
+        "view memory: {} MB in {tiles} tiles ({pools} pools), {} given back, {} tile uploads, {} tile checks, {} without a source",
         tiles >> 4,
+        EVICTED.load(Ordering::Relaxed),
         UPLOADED.load(Ordering::Relaxed),
         CHECKED.load(Ordering::Relaxed),
         NO_SOURCE.load(Ordering::Relaxed)
