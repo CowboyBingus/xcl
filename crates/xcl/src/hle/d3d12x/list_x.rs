@@ -1315,7 +1315,10 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         let Some(graph) = g.as_mut() else { return };
         let Some(tf) = graph.title_fences.get_mut(&title_fence) else { return };
         prune_title_fence(title_fence, tf);
-        let target_waiters: Vec<(usize, u64)> = tf.waits.iter().filter(|&&(v, _, _)| v <= sig_val).map(|&(_, wq, wseq)| (wq, wseq)).collect();
+        // (a wait an earlier signal of the fence satisfies does not wait on this one, as for the
+        // cells in `would_signal_close_cycle`)
+        let covered = tf.signals.iter().map(|s| s.val).max().unwrap_or(0);
+        let target_waiters: Vec<(usize, u64)> = tf.waits.iter().filter(|&&(v, _, _)| v <= sig_val && v > covered).map(|&(_, wq, wseq)| (wq, wseq)).collect();
         if target_waiters.is_empty() {
             return;
         }
@@ -6008,6 +6011,64 @@ mod tests {
                 would_signal_close_cycle(&mut gp, 0xC001, 0x4000, 0x6dc),
                 "a wait only this signal satisfies, armed before the waiter's own signal, MUST be a cycle"
             );
+        }
+    }
+
+    /// The next frame's Signal of a title fence does not break a "cycle" through a wait an earlier
+    /// signal of that fence satisfies; one that only the new signal satisfies is a cycle, broken
+    /// by releasing the cell's wait.
+    #[test]
+    fn a_title_fence_wait_an_earlier_signal_covers_is_no_cycle() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let title: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let cell: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (q0, q1, va, f) = (0xC0F0usize, 0xC0F1usize, 0x7E57_C0F0u64, title.as_raw() as usize);
+            // q1 signalled the fence at 1; q0 waits for that and signals the cell later, which q1
+            // waits for; q1 is about to signal the fence at 2
+            let set = |wait: u64| {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let gr = g.get_or_insert_with(SyncGraph::default);
+                let mut tf = TitleFenceSync::default();
+                tf.waits.push((wait, q0, 5));
+                tf.signals.push(SubmittedSignal { val: 1, queue: q1, seq: 3 });
+                gr.title_fences.insert(f, tf);
+                if !gr.cells.contains_key(&va) {
+                    ARMED_GPU_WAITS.fetch_add(1, Ordering::AcqRel);
+                    gr.cells.insert(
+                        va,
+                        SyncCell {
+                            fence: Some(cell.clone()),
+                            device: dev.as_raw() as usize,
+                            recorded_max: 9,
+                            submitted_max: 9,
+                            submitted_queue: Some(q0),
+                            armed_waits: vec![ArmedGpuWait { val: 9, waiting_queue: q1, waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_COMPUTE.0, wait_seq: 4, armed_at: Instant::now(), after_write64: false }],
+                            submitted_signals: vec![SubmittedSignal { val: 9, queue: q0, seq: 7 }],
+                            ..Default::default()
+                        },
+                    );
+                }
+            };
+            set(1);
+            break_cycles_before_title_signal(q1, f, 2);
+            assert_eq!(cell.GetCompletedValue(), 0, "the wait is the earlier signal's: nothing is released");
+            set(2);
+            break_cycles_before_title_signal(q1, f, 2);
+            assert_eq!(cell.GetCompletedValue(), 9, "a wait only the new signal satisfies: released");
+            let mut g = SYNC_GRAPH.lock().unwrap();
+            let gr = g.as_mut().unwrap();
+            gr.title_fences.remove(&f);
+            let left = gr.cells.remove(&va).map_or(0, |c| c.armed_waits.len());
+            if left > 0 {
+                ARMED_GPU_WAITS.fetch_sub(left, Ordering::AcqRel);
+            }
         }
     }
 
