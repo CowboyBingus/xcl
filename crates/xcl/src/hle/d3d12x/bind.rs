@@ -392,6 +392,26 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
     Ok((buf, va))
 }
 
+/// lab: the first user SGPR after the root arguments gets the address of the title's bound
+/// view heap (`list_x::title_view_heap`; `XCL_HEAP_SGPR=0`: not) – it was 0, and the world mesh
+/// programs that take their meshlet from a visible list (flags bit 28) read the list's V#
+/// from address 0 + slot * 32: every group then drew meshlet 0.
+fn heap_sgpr(list: *mut c_void, io: &mut Vec<u32>, known_layout: bool) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !known_layout || !*ON.get_or_init(|| !std::env::var("XCL_HEAP_SGPR").is_ok_and(|v| v.trim() == "0")) {
+        return;
+    }
+    let base = super::list_x::title_view_heap(list);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: view heap SGPR: s{} = {base:#x} ({n} so far)", io.len());
+    }
+    if base != 0 && io.len() < crate::gpu::recomp::IO_UMA_BASE_HI {
+        io.push(base as u32);
+    }
+}
+
 unsafe fn bind_two_pass_stage(
     this: *mut c_void,
     list: &ID3D12GraphicsCommandList,
@@ -429,6 +449,7 @@ unsafe fn bind_two_pass_stage(
         }
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
+    heap_sgpr(this, &mut io, layout.is_some());
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
@@ -1712,6 +1733,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         Some(l) => console_list::user_data_for(l, user_sgprs, &args, table_at as u64),
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
+    heap_sgpr(this, &mut io, layout.is_some());
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;

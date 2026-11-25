@@ -274,6 +274,8 @@ struct RenderTargets {
 #[derive(Default, Clone)]
 struct Bindings {
     heaps: Vec<usize>,
+    /// lab: console address of the title's bound shader-visible view heap (0: none)
+    title_view_heap: u64,
     topology: Option<u32>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<windows::Win32::Foundation::RECT>,
@@ -421,6 +423,14 @@ pub(super) fn watch_dsv(dsv: usize) {
     if !g.contains(&dsv) && g.len() < 8 {
         g.push(dsv);
     }
+}
+
+/// lab: the console address of the view heap the title bound on `list` (0: none). A console
+/// program that indexes the heap itself (the world mesh programs' visible-meshlet list:
+/// `s_load_dwordx4 s[0:3], s[heap], slot * 32`) has it in the first user SGPR after its root
+/// arguments.
+pub(super) fn title_view_heap(list: *mut c_void) -> u64 {
+    LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).map_or(0, |s| s.bindings.title_view_heap)
 }
 
 fn with_bindings(list: *mut c_void, f: impl FnOnce(&mut Bindings)) {
@@ -3603,6 +3613,25 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
+    {
+        // lab: where the title's view heap is in its memory (`title_view_heap`)
+        let mut base = 0u64;
+        if !heaps.is_null() {
+            for k in 0..n as usize {
+                let p = *heaps.add(k) as *mut c_void;
+                if p.is_null() {
+                    continue;
+                }
+                let Some(h) = ID3D12DescriptorHeap::from_raw_borrowed(&p) else { continue };
+                if h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV {
+                    if let Some(at) = super::console_heap::start(p as usize) {
+                        base = at;
+                    }
+                }
+            }
+        }
+        with_bindings(this, |b| b.title_view_heap = base);
+    }
     if heaps.is_null() || n == 0 {
         // no heaps: nothing bound any more (`ensure_view_heap` binds the shared heap again
         // before a translated draw or dispatch reads the memory windows from it)
