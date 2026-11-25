@@ -1376,7 +1376,7 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows: windows, ..Default::default() };
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows: windows, rodata: f.rodata(p), ..Default::default() };
                         let Ok(t) = recomp::translate(code, &opt) else { continue };
                         if !t.complete() {
                             continue;
