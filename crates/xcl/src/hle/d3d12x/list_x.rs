@@ -2840,6 +2840,25 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
 }
 
+/// lab: command list #101 (unknown console method; the retail title calls it ~2.5 times per
+/// world frame and never before the world): the first calls are logged with their arguments
+/// and what readable ones point at; answered 0 as the stub did
+pub(super) unsafe extern "system" fn unknown_101_x(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> u64 {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 16 || n % 64 == 0 {
+        let peek = |p: usize| -> String {
+            if p > 0x10000 && p & 3 == 0 && crate::gpu::shader::readable(p, 96) {
+                (0..12).map(|i| format!("{:x}", ((p + 8 * i) as *const u64).read_unaligned())).collect::<Vec<_>>().join(" ")
+            } else {
+                "-".into()
+            }
+        };
+        crate::xlog_info!("list #101 call {n} at {:.1} s on {this:p}: a1 {a1:#x} [{}] a2 {a2:#x} [{}] a3 {a3:#x} [{}] a4 {a4:#x} [{}] a5 {a5:#x} a6 {a6:#x}", crate::log::uptime(), peek(a1), peek(a2), peek(a3), peek(a4));
+    }
+    0
+}
+
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
 pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, dst: usize, src: usize, _flags: u32) {
