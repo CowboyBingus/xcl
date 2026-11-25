@@ -1441,6 +1441,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
     }
+    rt_writers_probe(this, pso);
     post_probe(this, pso);
     match bind_abi(this, &list, pso, true) {
         Ok(()) => {
@@ -1865,6 +1866,37 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
 /// Per texture: size, format, evicted, and the state of a texture kept in step. With
 /// `XCL_RT_DUMP` the textures it samples are dumped too (`rtd_<present>_<k>_s_...`): the raw
 /// texel of the 1x1 exposure target is in the "most common" list (w z y x, x = exposure).
+/// lab: `XCL_RT_WRITERS=<seconds>` – from then on, once per (VS, PS, target) of a translated
+/// draw into a target at least 1920 wide: the shaders' record hashes and the target (which pass
+/// writes the lit target), and again at its 50th draw.
+unsafe fn rt_writers_probe(this: *mut c_void, pso: usize) {
+    static FROM: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    let Some(from) = *FROM.get_or_init(|| std::env::var("XCL_RT_WRITERS").ok().and_then(|v| v.trim().parse().ok())) else { return };
+    if crate::log::uptime() < from {
+        return;
+    }
+    let Some((vs, ps)) = super::real::pso_shaders(super::pso_async::resolve(pso)) else { return };
+    let Some(r) = super::present::rt0_resource(this as usize) else { return };
+    let Some(d) = ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| x.GetDesc()) else { return };
+    if d.Width < 1920 {
+        return;
+    }
+    static SEEN: Mutex<Option<HashMap<(u64, u64, usize), u32>>> = Mutex::new(None);
+    let n = {
+        let mut g = SEEN.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.len() >= 600 && !m.contains_key(&(vs, ps, r)) {
+            return;
+        }
+        let n = m.entry((vs, ps, r)).or_insert(0);
+        *n += 1;
+        *n
+    };
+    if n == 1 || n == 50 {
+        crate::xlog_info!("rt writer: vs {vs:016x} ps {ps:016x} into {r:#x} {}x{} f{} at {:.1} s (draw {n})", d.Width, d.Height, d.Format.0, crate::log::uptime());
+    }
+}
+
 unsafe fn post_probe(this: *mut c_void, pso: usize) {
     static CFG: std::sync::OnceLock<Option<(f64, Option<u64>)>> = std::sync::OnceLock::new();
     let Some((from, only)) = *CFG.get_or_init(|| {
@@ -2035,7 +2067,12 @@ unsafe fn dispatch_probe(this: *mut c_void, pso: usize, groups: [u32; 3]) {
     let heap = super::list_x::title_view_heap(this) as usize;
     let mut found: Vec<(String, usize)> = Vec::new();
     let mut add = |tag: String, slot: usize, found: &mut Vec<(String, usize)>| {
-        if let Some(r) = super::console_heap::resource_at(slot) {
+        // a table's T# is a copy: its resource is the one of any slot with the same index (word 0)
+        let by_index = || {
+            let w0 = crate::gpu::shader::readable(slot, 4).then(|| (slot as *const u32).read_unaligned())?;
+            (w0 != 0).then(|| super::console_heap::resource_by_word0(w0)).flatten()
+        };
+        if let Some(r) = super::console_heap::resource_at(slot).or_else(by_index) {
             if !found.iter().any(|x| x.1 == r) {
                 found.push((tag, r));
             }
@@ -2058,7 +2095,7 @@ unsafe fn dispatch_probe(this: *mut c_void, pso: usize, groups: [u32; 3]) {
         .iter()
         .filter_map(|(tag, r)| {
             let d = ID3D12Resource::from_raw_borrowed(&(*r as *mut c_void)).map(|x| x.GetDesc())?;
-            (d.Dimension.0 >= 2).then(|| format!("{tag} {}x{} f{}{}", d.Width, d.Height, d.Format.0, if super::present::is_presented(*r) { " PRESENTED" } else { "" }))
+            (d.Dimension.0 >= 2).then(|| format!("{tag} {r:#x} {}x{} f{}{}", d.Width, d.Height, d.Format.0, if super::present::is_presented(*r) { " PRESENTED" } else { "" }))
         })
         .collect();
     let cs = super::real::pso_shaders(real).map_or(0, |s| s.0);
