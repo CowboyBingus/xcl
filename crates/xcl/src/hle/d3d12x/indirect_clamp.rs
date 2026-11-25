@@ -299,6 +299,44 @@ pub(super) unsafe fn bound_within(
             None => (source, None),
         },
     };
+    // lab: `XCL_CLAMP_SOURCE=args`: the records and the count are read through the title's own
+    // PC buffers (as the PC ExecuteIndirect would) instead of through the window buffers
+    static VIA_ARGS: OnceLock<bool> = OnceLock::new();
+    let via_args = *VIA_ARGS.get_or_init(|| std::env::var("XCL_CLAMP_SOURCE").is_ok_and(|v| v.trim() == "args"));
+    {
+        // where the records are (the first 48 distinct 64 KiB pages)
+        static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        if let Some((p, len)) = real::console_buffer(args) {
+            let page = (p + args_off as usize) >> 16;
+            let mut g = SEEN.lock().unwrap();
+            if g.len() < 48 && !g.contains(&page) {
+                g.push(page);
+                let u = crate::gpu::uma::get();
+                crate::xlog_info!(
+                    "indirect clamp: records of kind {} at {:#x} (buffer {p:#x}, {len} bytes, offset {args_off:#x}), window {:?}, sparse {:?}, source at {source_at:#x}, count buffer {:x?} offset {count_off:#x}, budget {budget}, via args {via_args}",
+                    s.kind,
+                    p + args_off as usize,
+                    u.and_then(|u| u.window_of(p)),
+                    u.map(|u| u.is_sparse(p)),
+                    real::console_buffer(count_buf)
+                );
+            }
+        }
+    }
+    let (source, source_at, counts, count_at) = if via_args {
+        let raw = args as *mut c_void;
+        let a = ID3D12Resource::from_raw_borrowed(&raw)?.GetGPUVirtualAddress() + args_off + real::buffer_delta(args);
+        let (c, c_at) = match (count_buf, count_at) {
+            (cb, Some(_)) if cb != 0 => {
+                let raw = cb as *mut c_void;
+                (ID3D12Resource::from_raw_borrowed(&raw)?.GetGPUVirtualAddress() + count_off + real::buffer_delta(cb), Some(0))
+            }
+            _ => (a, None),
+        };
+        (a, 0, c, c_at)
+    } else {
+        (source, source_at, counts, count_at)
+    };
     let mut dev: Option<ID3D12Device> = None;
     list.GetDevice(&mut dev).ok()?;
     let dev = dev?;
