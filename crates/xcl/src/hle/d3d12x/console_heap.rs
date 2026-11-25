@@ -410,7 +410,8 @@ static RES: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(
 
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
-    if s.sampler || !super::present::trace_frame() {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if s.sampler || !(super::present::trace_frame() || *PROBE.get_or_init(|| std::env::var_os("XCL_POST_PROBE").is_some())) {
         return;
     }
     let mut g = RES.lock().unwrap();
