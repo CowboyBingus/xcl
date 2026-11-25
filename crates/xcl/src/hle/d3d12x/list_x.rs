@@ -1814,6 +1814,22 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
                 let completed = prune_completed_waits(cell);
                 if completed >= w.value {
                     // Fence already reached `w.value`: trust it if CPU memory agrees (not reset).
+                    // lab: `XCL_WAIT64_TRUST_FENCE=1` – trust it anyway (a value written into a
+                    // shadowed window is in its video-memory copy: the CPU's memory held 0 and
+                    // every such wait cost the submitting thread `WAIT_TIMEOUT`), and the CPU's
+                    // memory gets the value if it is behind.
+                    static TRUST: OnceLock<bool> = OnceLock::new();
+                    if !w.is_satisfied() && *TRUST.get_or_init(|| std::env::var("XCL_WAIT64_TRUST_FENCE").is_ok_and(|v| v.trim() == "1")) {
+                        static N: AtomicU64 = AtomicU64::new(0);
+                        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 4 || n.is_power_of_two() {
+                            crate::xlog_info!("D3D12.X: Wait64BitValueX at {:#x} >= {:#x}: the fence is at {completed:#x}, memory holds {:x?} – taken as done ({n} so far)", w.va, w.value, w.read_value());
+                        }
+                        if crate::gpu::shader::readable(w.va as usize, 8) && super::cpu_writes::writable(w.va as usize, 8) {
+                            (*(w.va as usize as *const AtomicU64)).fetch_max(w.value, Ordering::AcqRel);
+                        }
+                        return GpuWaitOutcome::Handled;
+                    }
                     return if w.is_satisfied() { GpuWaitOutcome::Handled } else { GpuWaitOutcome::FallbackCpu };
                 }
                 if cell.submitted_max >= w.value && cell.submitted_queue == Some(q_raw) {

@@ -14,6 +14,20 @@ fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
     v
 }
 
+/// A program with heap windows reaches every window descriptor of the shared heap – the
+/// unified block's and the view windows after them (`d3d12x::view_mem`) – as the HLSL path's
+/// accessors do; without the heap only the unified block's windows.
+#[test]
+fn heap_windows_reach_the_view_windows() {
+    use super::lower_mem::heap_window_bound;
+    let slots = crate::gpu::recomp::HEAP_WINDOW_SLOTS;
+    assert!(slots as usize >= crate::gpu::uma::MAX_WINDOWS);
+    for mems in 2..=crate::gpu::uma::MAX_WINDOWS {
+        assert_eq!(heap_window_bound(mems), slots, "{mems} unified windows");
+    }
+    assert_eq!(heap_window_bound(slots as usize + 1), slots + 1, "never fewer than the program's own");
+}
+
 #[test]
 fn straight_line_and_loop_kernels_validate() {
     let code = prog(&[

@@ -178,6 +178,15 @@ const EVICT_BATCH: usize = 512;
 /// budget for this long instead of trying again for every tile.
 const EVICT_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 
+static LAB_EVICT_SHARED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static LAB_SEEN_NO_TOUCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// lab: `XCL_EVICT_SHARED=1` (textures whose pages are all shared are evicted too: a group of
+/// them over the same pages was never evicted), `XCL_SEEN_TOUCH=0` (see `seen`): the variable
+/// is set to "1" for the first, "0" for the second.
+fn lab_flag(cell: &std::sync::OnceLock<bool>, var: &str) -> bool {
+    *cell.get_or_init(|| std::env::var(var).is_ok_and(|v| v.trim() == if var == "XCL_SEEN_TOUCH" { "0" } else { "1" }))
+}
+
 /// Page budget: pool heaps the pages may take, from `XCL_PAGE_BUDGET_MB` (0: no limit).
 fn pool_cap() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -671,7 +680,7 @@ impl Pages {
             // a texture whose pages all are other mapped textures' too gives nothing back
             let alone = t.used.iter().any(|a| self.pages.get(a).is_some_and(|p| p.users <= 1))
                 || t.used_extra.iter().any(|k| self.extra_pages.get(k).is_some_and(|p| p.users <= 1));
-            if !alone {
+            if !alone && !lab_flag(&LAB_EVICT_SHARED, "XCL_EVICT_SHARED") {
                 shared += 1;
                 continue;
             }
@@ -1068,6 +1077,10 @@ pub(super) fn tracking() -> bool {
 /// next work.
 pub(super) fn seen(visible: &[usize], cpu_only: &[usize]) -> Vec<usize> {
     let now = std::time::Instant::now();
+    // lab: `XCL_SEEN_TOUCH=0` – a T# in a view heap does not keep a texture (a retail title
+    // has every streamed texture there: nothing was evicted), and an evicted one comes back
+    // only with a transition or a CPU write
+    let no_touch = lab_flag(&LAB_SEEN_NO_TOUCH, "XCL_SEEN_TOUCH");
     HEAPS_LOOKED.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut g = PAGES.lock().unwrap();
     for pages in g.values_mut().flatten() {
@@ -1076,7 +1089,9 @@ pub(super) fn seen(visible: &[usize], cpu_only: &[usize]) -> Vec<usize> {
         }
         for r in visible {
             if let Some(t) = pages.targets.get_mut(r) {
-                t.touched = now;
+                if !no_touch {
+                    t.touched = now;
+                }
                 t.seen = Seen::Visible;
             }
         }
@@ -1087,7 +1102,7 @@ pub(super) fn seen(visible: &[usize], cpu_only: &[usize]) -> Vec<usize> {
         }
     }
     drop(g);
-    if !any_evicted() {
+    if !any_evicted() || no_touch {
         return Vec::new();
     }
     let e = EVICTED.lock().unwrap();

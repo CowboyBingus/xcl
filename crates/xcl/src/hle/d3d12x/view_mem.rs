@@ -61,6 +61,9 @@ static UPLOADED: AtomicU64 = AtomicU64::new(0);
 static CHECKED: AtomicU64 = AtomicU64::new(0);
 static NO_SOURCE: AtomicU64 = AtomicU64::new(0);
 static FULL: AtomicU64 = AtomicU64::new(0);
+/// tiles and pools of the state, for `stats` (which must not wait for an `ensure` in progress)
+static TILES: AtomicU64 = AtomicU64::new(0);
+static POOLS: AtomicU64 = AtomicU64::new(0);
 
 fn buffer_desc(bytes: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
     D3D12_RESOURCE_DESC {
@@ -197,7 +200,17 @@ pub unsafe fn ensure(va: usize, len: usize) {
             continue;
         }
         let Some(src) = source(tile) else {
-            NO_SOURCE.fetch_add(1, Ordering::Relaxed);
+            // the first few say why (asked range, what the page maps show): a range past a
+            // buffer's end is expected here, a mapped page that cannot be read is not
+            if NO_SOURCE.fetch_add(1, Ordering::Relaxed) < 12 {
+                use crate::hle::kernelx;
+                crate::xlog_info!(
+                    "D3D12.X: view memory: no source for tile {tile:#x} of {va:#x}+{len:#x}: page mapping {:x?}, CPU view {:x?}, physical page here {}",
+                    kernelx::mirrors::mapped_source(tile),
+                    kernelx::mirrors::source(tile),
+                    kernelx::physical_page_at(tile)
+                );
+            }
             continue;
         };
         CHECKED.fetch_add(1, Ordering::Relaxed);
@@ -221,6 +234,7 @@ pub unsafe fn ensure(va: usize, len: usize) {
             }
         }
     }
+    TILES.store(s.tiles.len() as u64, Ordering::Relaxed);
     if todo.is_empty() {
         return;
     }
@@ -244,6 +258,7 @@ pub unsafe fn ensure(va: usize, len: usize) {
                 continue;
             }
             s.pools.push(heap.unwrap());
+            POOLS.store(s.pools.len() as u64, Ordering::Relaxed);
             s.next = 0;
         }
         let k = (tile - s.base) / WINDOW - FIRST;
@@ -337,7 +352,7 @@ pub unsafe fn ensure_for_draw(layout: Option<&super::console_list::Layout>, args
 
 /// One line for the activity log.
 pub fn stats() -> String {
-    let (tiles, pools) = STATE.lock().unwrap().as_ref().map_or((0, 0), |s| (s.tiles.len(), s.pools.len()));
+    let (tiles, pools) = (TILES.load(Ordering::Relaxed), POOLS.load(Ordering::Relaxed));
     format!(
         "view memory: {} MB in {tiles} tiles ({pools} pools), {} tile uploads, {} tile checks, {} without a source",
         tiles >> 4,

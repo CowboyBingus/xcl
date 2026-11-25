@@ -151,6 +151,15 @@ pub struct FmtComp1 {
     pub dflt: Value,
 }
 
+/// Windows a program with heap windows (`Lw::heap_mem`) may select: the descriptors
+/// `MEM_HEAP_BASE`.. hold the unified block's windows and, after them, the title's memory
+/// outside it (`recomp::HEAP_WINDOW_SLOTS`, `d3d12x::view_mem`) – the same bound as the HLSL
+/// path's accessors (`recomp::emit::mem_accessors`). With the unified block's count alone a
+/// direct-translated compute program read 0 from a retail title's GPU view.
+pub(crate) fn heap_window_bound(mems: usize) -> u32 {
+    (mems as u32).max(crate::gpu::recomp::HEAP_WINDOW_SLOTS)
+}
+
 impl Lw {
     /// Runs `f` on the active memory window (`mem`, `mem1`.. at u2.., or descriptor heap
     /// when `self.heap_mem` is set via `XCL_HEAP_WINDOWS`), returning `out_tys.len()` values
@@ -173,7 +182,7 @@ impl Lw {
         // Descriptor-heap windows (`#1693`, `XCL_HEAP_WINDOWS=1`): single guarded heap lookup
         // combined with `guard`, stacking cleanly with vector loads/stores & FormatLoad opt.
         if let Some(coherent) = self.heap_mem {
-            let windows = self.mems.len() as u32;
+            let windows = heap_window_bound(self.mems.len());
             let w = self.rd(super::lower::VAR_WIN);
             let inside = self.cmpc(Pred::ULt, w, windows);
             let cond = match guard {
@@ -345,7 +354,7 @@ impl Lw {
             }
         }
         if let Some(coherent) = self.heap_mem {
-            let windows = self.mems.len() as u32;
+            let windows = heap_window_bound(self.mems.len());
             let w = self.rd(super::lower::VAR_WIN);
             let inside = self.cmpc(Pred::ULt, w, windows);
             let cond = match guard {
