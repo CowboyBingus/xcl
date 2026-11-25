@@ -3677,6 +3677,7 @@ fn compile_slots(bytes: usize) -> &'static Slots {
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
 /// waits for its slot first (`big_compile_turn`; not a title thread's, nor one the title waits
 /// for). Logs its time, size and whether it was gated.
+#[cfg(test)]
 fn driver_compile<R>(kind: &str, bytes: usize, gate: bool, build: impl FnOnce() -> R) -> R {
     driver_compile_identified(kind, bytes, gate, None, build).0
 }
@@ -4016,6 +4017,7 @@ pub(crate) mod driver_cache {
     /// builds shorter than this are not worth a file
     const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
     static HITS: AtomicU64 = AtomicU64::new(0);
+    static MESH_HITS: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     static STORED: AtomicU64 = AtomicU64::new(0);
 
@@ -4029,6 +4031,11 @@ pub(crate) mod driver_cache {
         format!("gfx-{hash:016x}-{bytes:x}.pso")
     }
 
+    /// The file of a two-pass mesh pipeline keyed by its stream digest (`mesh_blob_key`).
+    pub fn mesh_name(hash: u64, bytes: usize) -> String {
+        format!("mesh-{hash:016x}-{bytes:x}.pso")
+    }
+
     fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
@@ -4040,6 +4047,10 @@ pub(crate) mod driver_cache {
 
     pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {
         enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(graphics_name(hash, bytes)))
+    }
+
+    pub fn mesh_path(hash: u64, bytes: usize) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(mesh_name(hash, bytes)))
     }
 
     pub fn load(p: &Path) -> Option<Vec<u8>> {
@@ -4060,6 +4071,14 @@ pub(crate) mod driver_cache {
             if STALE.fetch_add(1, Ordering::Relaxed) == 0 {
                 crate::xlog_info!("D3D12.X: a driver blob kept on disk was refused (another driver or adapter?) – such pipelines are compiled again");
             }
+        }
+    }
+
+    /// A two-pass mesh pipeline was made from a blob kept on disk.
+    pub fn note_mesh_hit() {
+        let n = MESH_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: {n} mesh pipelines made from the driver's blob of an earlier run (kept on disk)");
         }
     }
 
@@ -4495,6 +4514,266 @@ mod graphics_blob_tests {
             b.DepthStencilState.StencilWriteMask = 0x7F;
             assert_ne!(ka, graphics_blob_key(&b, b"vs", Some(b"ps"), None, &[]));
         }
+    }
+}
+
+#[cfg(test)]
+mod mesh_blob_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+
+    /// The state of a two-pass mesh pipeline, as `translated_gs_pso` writes it.
+    struct State {
+        blend: D3D12_BLEND_DESC,
+        mask: u32,
+        rast: D3D12_RASTERIZER_DESC,
+        depth: D3D12_DEPTH_STENCIL_DESC,
+        rt: D3D12_RT_FORMAT_ARRAY,
+        dsv: DXGI_FORMAT,
+        samples: DXGI_SAMPLE_DESC,
+        flags: D3D12_PIPELINE_STATE_FLAGS,
+    }
+
+    fn state() -> State {
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].RenderTargetWriteMask = 0xF;
+        let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+        rt.RTFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+        State {
+            blend,
+            mask: u32::MAX,
+            rast: D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_BACK, DepthClipEnable: true.into(), ..Default::default() },
+            depth: D3D12_DEPTH_STENCIL_DESC { DepthEnable: true.into(), DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL, DepthFunc: D3D12_COMPARISON_FUNC_LESS, ..Default::default() },
+            rt,
+            dsv: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT,
+            samples: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            flags: D3D12_PIPELINE_STATE_FLAG_NONE,
+        }
+    }
+
+    fn stream(rs: usize, ms: &[u8], ps: Option<&[u8]>, s: &State) -> StreamOut {
+        let mut out = StreamOut::default();
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+        if let Some(p) = ps {
+            out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
+        }
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &s.blend);
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &s.mask);
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &s.rast);
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, &s.depth);
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &s.rt);
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &s.dsv);
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &s.samples);
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &s.flags);
+        out
+    }
+
+    type Samplers<'a> = &'a [crate::gpu::recomp::pso::StaticSampler];
+
+    /// `blob` in the store as the blob of `key`, as `keep_mesh_blob` keeps one.
+    fn put_mesh_blob(key: (u64, usize), blob: std::sync::Arc<Vec<u8>>) {
+        forget_mesh_blob(key);
+        let mut g = MESH_BLOBS.lock().unwrap();
+        let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
+        *total += blob.len();
+        m.insert(key, blob);
+    }
+
+    /// The key follows every shader, sampler and state subobject of the stream, and nothing
+    /// else: not the addresses of the shaders or the root signature, not struct padding.
+    #[test]
+    fn mesh_blob_key_tracks_shaders_samplers_and_state() {
+        let (ms, ps) = (b"ms-dxil-1".to_vec(), b"ps-dxil-1".to_vec());
+        let s0 = state();
+        let k = |rs: usize, ms: &[u8], ps: Option<&[u8]>, s: &State, samplers: Samplers| unsafe { mesh_blob_key(&stream(rs, ms, ps, s), samplers) };
+        let k0 = k(0x1000, &ms, Some(&ps), &s0, &[]);
+        assert_eq!(k0.1, ms.len() + ps.len());
+        // stable: the same stream again, the same code at other addresses, another RS address
+        assert_eq!(k0, k(0x1000, &ms, Some(&ps), &s0, &[]));
+        assert_eq!(k0, k(0x1000, &ms.clone(), Some(&ps.clone()), &s0, &[]));
+        assert_eq!(k0, k(0x2000, &ms, Some(&ps), &s0, &[]));
+        // shaders and samplers
+        assert_ne!(k0, k(0x1000, b"ms-dxil-2", Some(&ps), &s0, &[]));
+        assert_ne!(k0, k(0x1000, &ms, Some(b"ps-dxil-2"), &s0, &[]));
+        assert_ne!(k0, k(0x1000, &ms, None, &s0, &[]));
+        assert_ne!(k0, k(0x1000, &ms, Some(&ps), &s0, &[([1, 2, 3, 4], false)]));
+        assert_ne!(k(0x1000, &ms, Some(&ps), &s0, &[([1, 2, 3, 4], false)]), k(0x1000, &ms, Some(&ps), &s0, &[([1, 2, 3, 4], true)]));
+        // each state subobject
+        let changes: [(&str, fn(&mut State)); 11] = [
+            ("blend", |s| s.blend.RenderTarget[0].BlendEnable = true.into()),
+            ("blend RT 7", |s| s.blend.RenderTarget[7].RenderTargetWriteMask = 1),
+            ("sample mask", |s| s.mask = 1),
+            ("cull", |s| s.rast.CullMode = D3D12_CULL_MODE_NONE),
+            ("depth bias", |s| s.rast.DepthBias = 4),
+            ("depth func", |s| s.depth.DepthFunc = D3D12_COMPARISON_FUNC_GREATER),
+            ("stencil write mask", |s| s.depth.StencilWriteMask = 0x7F),
+            ("RT format", |s| s.rt.RTFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT),
+            ("DSV format", |s| s.dsv = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D24_UNORM_S8_UINT),
+            ("sample count", |s| s.samples.Count = 4),
+            ("flags", |s| s.flags = D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG),
+        ];
+        for (what, change) in changes {
+            let mut s = state();
+            change(&mut s);
+            assert_ne!(k0, k(0x1000, &ms, Some(&ps), &s, &[]), "{what} must change the key");
+        }
+        // padding: the bytes after each RT's write mask and after the stencil masks
+        let mut s = state();
+        unsafe {
+            for rt in &mut s.blend.RenderTarget {
+                let at = (rt as *mut D3D12_RENDER_TARGET_BLEND_DESC as *mut u8).add(37);
+                std::ptr::write_bytes(at, 0xAA, 3);
+            }
+            std::ptr::write_bytes((&mut s.depth as *mut D3D12_DEPTH_STENCIL_DESC as *mut u8).add(18), 0x55, 2);
+        }
+        assert_eq!(k0, k(0x1000, &ms, Some(&ps), &s, &[]), "padding bytes must not affect mesh_blob_key");
+        // fewer subobjects: another stream
+        let mut other = StreamOut::default();
+        other.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &0x1000usize);
+        other.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
+        other.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps);
+        other.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &s0.mask);
+        assert_ne!(k0, unsafe { mesh_blob_key(&other, &[]) });
+    }
+
+    /// A bounded in-memory store: a blob is found until it is forgotten.
+    #[test]
+    fn a_mesh_blob_is_found_until_forgotten() {
+        let key = (0x7E57_0000_0000_0001u64, 1);
+        put_mesh_blob(key, std::sync::Arc::new(vec![1, 2, 3]));
+        assert_eq!(cached_mesh_blob(key, None).0.as_deref().map(Vec::len), Some(3));
+        assert!(!cached_mesh_blob(key, None).1, "from memory, not disk");
+        let before = MESH_BLOBS.lock().unwrap().as_ref().unwrap().1;
+        forget_mesh_blob(key);
+        assert!(mesh_blob(key).is_none());
+        assert_eq!(MESH_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
+        assert_eq!(cached_mesh_blob(key, None), (None, true));
+    }
+
+    /// A driver that refuses the stream with the topology subobject: the pipeline is made from
+    /// the bare stream, as before the blob cache, and no blob is kept for it; a blob it refuses
+    /// is forgotten first.
+    #[test]
+    fn a_stream_refused_with_the_topology_is_made_without_it() {
+        let (ms, ps) = (b"ms".to_vec(), b"ps".to_vec());
+        let out = stream(0x1000, &ms, Some(&ps), &state());
+        let key = (0x7E57_0000_0000_0002u64, 2);
+        for cached in [None, Some(std::sync::Arc::new(vec![1u8, 2, 3]))] {
+            if let Some(b) = &cached {
+                put_mesh_blob(key, b.clone());
+            }
+            let mut calls = Vec::new();
+            let mut pso: *mut c_void = std::ptr::null_mut();
+            let (hr, reused) = unsafe {
+                create_mesh_pso(&out, key, (cached.clone(), false), None, 0, "test MS", 0, &mut pso, |desc| {
+                    let d = &*(desc as *const D3D12_PIPELINE_STATE_STREAM_DESC);
+                    let subs = stream_subobjects(std::slice::from_raw_parts(d.pPipelineStateSubobjectStream as *const u8, d.SizeInBytes)).unwrap();
+                    let topology = subs.iter().any(|(ty, _)| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32);
+                    let blob = subs.iter().any(|(ty, p)| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO.0 as u32 && p[8..16] != [0; 8]);
+                    calls.push((topology, blob));
+                    if topology {
+                        E_INVALIDARG
+                    } else {
+                        0
+                    }
+                })
+            };
+            assert_eq!((hr, reused), (0, false));
+            let want = if cached.is_some() { vec![(true, true), (true, false), (false, false)] } else { vec![(true, false), (false, false)] };
+            assert_eq!(calls, want);
+            assert!(mesh_blob(key).is_none(), "no blob kept for a pipeline made without the topology");
+        }
+    }
+
+    /// GPU: a mesh pipeline built a second time is made from the driver's blob of the first
+    /// build; a blob the driver refuses is dropped and the pipeline compiled without it.
+    #[test]
+    fn gpu_a_mesh_pipeline_built_again_gets_the_blob_of_its_first_build() {
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.is_err() || dev.is_none() {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        let dev = dev.unwrap();
+        let mut o7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+        let mesh = unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &mut o7 as *mut _ as *mut c_void, size_of_val(&o7) as u32) }.is_ok()
+            && o7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0;
+        if !mesh {
+            crate::gpu::recomp::runner::skip_test("no mesh shaders");
+            return;
+        }
+        let ms_src = r#"
+struct V { float4 p : SV_Position; };
+[numthreads(1, 1, 1)] [outputtopology("triangle")]
+void main(out vertices V v[3], out indices uint3 t[1]) {
+    SetMeshOutputCounts(3, 1);
+    v[0].p = float4(-1, -1, 0, 1); v[1].p = float4(3, -1, 0, 1); v[2].p = float4(-1, 3, 0, 1);
+    t[0] = uint3(0, 1, 2);
+}
+"#;
+        let ps_src = "float4 main(float4 p : SV_Position) : SV_Target { return float4(p.xy * 0.01, 0, 1); }\n";
+        let (ms, ps) = match (crate::gpu::recomp::dxc::compile(ms_src, "main", "ms_6_5", &[]), crate::gpu::recomp::dxc::compile(ps_src, "main", "ps_6_5", &[])) {
+            (Ok(m), Ok(p)) => (m, p),
+            (m, p) => {
+                eprintln!("DXC: {:?} {:?}", m.err(), p.err());
+                crate::gpu::recomp::runner::skip_test("no DXC");
+                return;
+            }
+        };
+        let rs = crate::gpu::recomp::pso::abi_root_signature_with(&dev, true, &[]).expect("root signature");
+        let mut s = state();
+        s.dsv = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+        s.depth.DepthEnable = false.into();
+        s.rast.CullMode = D3D12_CULL_MODE_NONE;
+        let out = stream(rs.as_raw() as usize, &ms, Some(&ps), &s);
+        let key = unsafe { mesh_blob_key(&out, &[]) };
+        forget_mesh_blob(key);
+        let dev2: ID3D12Device2 = dev.cast().expect("ID3D12Device2");
+        // the driver's CreatePipelineState, not XCL's hook (which empties a title's CACHED_PSO):
+        // D3D12CreateDevice gives every test the one device of the adapter, adopted by others
+        let raw = dev2.as_raw();
+        let create_pso: PsoFn = unsafe {
+            if is_adopted(raw) {
+                std::mem::transmute(orig_fn(raw, slot_of(raw, "CreatePipelineState")))
+            } else {
+                std::mem::transmute(dev2.vtable().CreatePipelineState)
+            }
+        };
+        let iid = pc_iid(Kind::PipelineState);
+        let mut supplied = Vec::new();
+        // one build: whether the driver call had a blob in its CACHED_PSO, the pipeline released
+        let mut build = || unsafe {
+            let mut pso: *mut c_void = std::ptr::null_mut();
+            let ppv: *mut *mut c_void = &mut pso;
+            let r = create_mesh_pso(&out, key, cached_mesh_blob(key, None), None, 0, "test MS", 0, ppv, |desc| {
+                let d = &*(desc as *const D3D12_PIPELINE_STATE_STREAM_DESC);
+                let subs = std::slice::from_raw_parts(d.pPipelineStateSubobjectStream as *const u8, d.SizeInBytes);
+                let blob = |(ty, p): &(u32, &[u8])| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO.0 as u32 && p[8..16] != [0; 8];
+                supplied.push(stream_subobjects(subs).unwrap().iter().any(blob));
+                create_pso(raw, desc, &iid, ppv)
+            });
+            let made = !pso.is_null();
+            if made {
+                drop(ID3D12PipelineState::from_raw(pso));
+            }
+            (r.0, r.1, made)
+        };
+        // first build: compiled, its blob kept
+        let (hr, reused, made) = build();
+        assert!(hr >= 0 && !reused && made, "first build {hr:#x}");
+        let Some(first) = mesh_blob(key) else { panic!("the driver gave no blob of the mesh pipeline") };
+        // second build: from the blob
+        let (hr, reused, made) = build();
+        assert!(hr >= 0 && reused && made, "second build {hr:#x}, reused {reused}");
+        // a blob the driver refuses: dropped, compiled again without it, the new blob kept
+        put_mesh_blob(key, std::sync::Arc::new(vec![0xAB; 64]));
+        let (hr, reused, made) = build();
+        assert!(hr >= 0 && !reused && made, "build after a refused blob {hr:#x}");
+        drop(build);
+        assert_eq!(supplied, vec![false, true, true, false], "a blob in each driver call");
+        assert!(mesh_blob(key).is_some_and(|b| b.len() == first.len() && b[..] != [0xAB; 64][..]), "the driver's blob kept again");
+        forget_mesh_blob(key);
     }
 }
 
@@ -5143,30 +5422,204 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>
     }
 }
 
+/// The driver's compiled form of two-pass mesh pipelines (pass-through MS + the title's PS and
+/// state, `finish_two_pass`), keyed by `mesh_blob_key`, up to `MESH_BLOBS_MAX` bytes in all.
+/// A retail title's 260 – 430 KB ones took 3 – 6.5 s each in the driver in every run.
+static MESH_BLOBS: Mutex<Option<(HashMap<(u64, usize), std::sync::Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
+const MESH_BLOBS_MAX: usize = 256 << 20;
+
+fn mesh_blob(key: (u64, usize)) -> Option<std::sync::Arc<Vec<u8>>> {
+    MESH_BLOBS.lock().unwrap().as_ref().and_then(|(m, _)| m.get(&key).cloned())
+}
+
+fn forget_mesh_blob(key: (u64, usize)) {
+    if let Some((m, total)) = MESH_BLOBS.lock().unwrap().as_mut() {
+        if let Some(b) = m.remove(&key) {
+            *total -= b.len();
+        }
+    }
+}
+
+unsafe fn keep_mesh_blob(key: (u64, usize), pso: *mut c_void) {
+    if pso.is_null() || mesh_blob(key).is_some() {
+        return;
+    }
+    let Some(bytes) = read_pso_cached_blob(pso) else { return };
+    let mut g = MESH_BLOBS.lock().unwrap();
+    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
+    if bytes.is_empty() || *total + bytes.len() > MESH_BLOBS_MAX {
+        return;
+    }
+    *total += bytes.len();
+    m.insert(key, std::sync::Arc::new(bytes));
+}
+
+/// Deterministic FNV-1a digest of a two-pass mesh pipeline's stream (as built, before its
+/// CACHED_PSO) for its driver blob, like `graphics_blob_key`: each shader by the hash and length
+/// of its code (not its address), the root signature by its static samplers (not its address),
+/// the other subobjects' bytes in stream order with struct padding left out, and the view
+/// instance locations by their contents. Returns (digest, shader bytes).
+unsafe fn mesh_blob_key(stream: &StreamOut, samplers: &[crate::gpu::recomp::pso::StaticSampler]) -> (u64, usize) {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let feed = |h: &mut u64, bytes: &[u8]| {
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    let feed_u64 = |h: &mut u64, v: u64| feed(h, &v.to_le_bytes());
+    feed(&mut h, b"two-pass mesh");
+    feed_u64(&mut h, samplers.len() as u64);
+    for (w, cmp) in samplers {
+        for &x in w {
+            feed(&mut h, &x.to_le_bytes());
+        }
+        feed(&mut h, &[*cmp as u8]);
+    }
+    let u32_at = |p: &[u8], at: usize| p.get(at..at + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    for (ty, p) in stream_subobjects(&stream.0).unwrap_or_default() {
+        feed(&mut h, &ty.to_le_bytes());
+        match ty {
+            // the root signature: by its samplers (above)
+            0 => {}
+            t if SHADER_SUBOBJECTS.iter().any(|s| s.0 as u32 == t) => {
+                let code = payload_shader(p).unwrap_or(&[]);
+                feed_u64(&mut h, crate::gpu::shader::fnv64(code));
+                feed_u64(&mut h, code.len() as u64);
+            }
+            // BLEND: two BOOLs, then 8 render targets of 37 bytes + 3 of padding
+            8 => {
+                feed(&mut h, &p[..8]);
+                for rt in p[8..].chunks_exact(40) {
+                    feed(&mut h, &rt[..37]);
+                }
+            }
+            // DEPTH_STENCIL(1): 2 bytes of padding after StencilWriteMask
+            11 | 21 => {
+                feed(&mut h, &p[..18]);
+                feed(&mut h, &p[20..]);
+            }
+            // DEPTH_STENCIL2: 2 bytes of padding after each face's stencil masks
+            26 => {
+                feed(&mut h, &p[..34]);
+                feed(&mut h, &p[36..54]);
+                feed(&mut h, &p[56..]);
+            }
+            // VIEW_INSTANCING: count, the locations it points to, flags
+            22 => {
+                let n = u32_at(p, 0) as usize;
+                feed(&mut h, &p[..4]);
+                let at = u64::from_le_bytes(p[8..16].try_into().unwrap()) as usize;
+                if n > 0 && at != 0 && crate::gpu::shader::readable(at, n * 8) {
+                    feed(&mut h, std::slice::from_raw_parts(at as *const u8, n * 8));
+                }
+                feed(&mut h, &p[16..20]);
+            }
+            _ => feed(&mut h, p),
+        }
+    }
+    (h, stream.shader_bytes())
+}
+
+/// The blob of `key` from this run (memory) or an earlier one (`disk`); whether it was read
+/// from disk.
+fn cached_mesh_blob(key: (u64, usize), disk: Option<&std::path::Path>) -> (Option<std::sync::Arc<Vec<u8>>>, bool) {
+    match mesh_blob(key) {
+        Some(b) => (Some(b), false),
+        None => (disk.and_then(driver_cache::load).map(std::sync::Arc::new), true),
+    }
+}
+
+/// Create the mesh pipeline of `stream` through `create` (given a
+/// D3D12_PIPELINE_STATE_STREAM_DESC) with `cached`, the driver's blob of an earlier build of
+/// `key`, in a CACHED_PSO subobject; compiled without it when the driver refuses it (another
+/// driver or adapter, D3D12_ERROR_DRIVER_VERSION_MISMATCH / ADAPTER_NOT_FOUND, E_INVALIDARG:
+/// a file on disk is dropped), and as the bare `stream` when it refuses that too. The blob of a pipeline compiled here with `keep_min` or more
+/// bytes of shaders is kept, in memory and (a slow compile) on disk at `disk`.
+/// Returns the result and whether the blob made the pipeline.
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_mesh_pso(
+    stream: &StreamOut,
+    key: (u64, usize),
+    (cached, from_disk): (Option<std::sync::Arc<Vec<u8>>>, bool),
+    disk: Option<&std::path::Path>,
+    keep_min: usize,
+    kind: &str,
+    record: u64,
+    ppv: *mut *mut c_void,
+    mut create: impl FnMut(*const c_void) -> HRESULT,
+) -> (HRESULT, bool) {
+    let bytes = stream.shader_bytes();
+    // The D3D12 runtime takes the blob of a mesh pipeline only when the stream names its
+    // primitive topology (without one it says the blob "does not match the rest of the
+    // description", as for any blob), so the stream gets TRIANGLE (the pass-through MS's output
+    // topology) and a CACHED_PSO subobject (empty without a blob). Without the topology
+    // (`topology` false) it is the stream as before: #724 saw retail mesh streams refused with
+    // the title's topology subobject.
+    let with = |b: Option<&[u8]>, topology: bool| {
+        let mut s = StreamOut(stream.0.clone(), stream.1);
+        if topology {
+            s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+            let state = b.map_or_else(D3D12_CACHED_PIPELINE_STATE::default, |b| D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() });
+            s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &state);
+        }
+        s
+    };
+    let mut build = |what: &str, s: &StreamOut, blob: bool| {
+        let desc: [usize; 2] = [s.0.len(), s.0.as_ptr() as usize];
+        driver_compile_identified(what, bytes, false, Some((record, blob)), || create(desc.as_ptr() as *const c_void))
+    };
+    let (mut hr, mut took) = build(kind, &with(cached.as_deref().map(Vec::as_slice), true), cached.is_some());
+    let reused = hr >= 0 && cached.is_some();
+    if hr < 0 && cached.is_some() {
+        forget_mesh_blob(key);
+        if from_disk {
+            driver_cache::note(false, disk);
+        }
+        let (retried, t) = build(&format!("{kind} retry"), &with(None, true), false);
+        hr = retried;
+        took += t;
+    }
+    let mut topology = true;
+    if hr == E_INVALIDARG {
+        // as before: no topology, and no blob kept (a later build with the topology would not
+        // match it); other errors (E_OUTOFMEMORY: `with_switch_fallback`) are not retried here
+        let (retried, t) = build(&format!("{kind} without topology"), &with(None, false), false);
+        hr = retried;
+        took += t;
+        topology = false;
+    }
+    if hr >= 0 && !reused && topology && bytes >= keep_min {
+        keep_mesh_blob(key, *ppv);
+        if let (Some(p), Some(b)) = (disk, mesh_blob(key)) {
+            driver_cache::keep(p, &b, took);
+        }
+    } else if reused && from_disk {
+        driver_cache::note_mesh_hit();
+    }
+    (hr, reused)
+}
+
 /// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
 /// the title gets the mesh pipeline state.
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, ms_hash: u64, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_two_pass(
+    this: *mut c_void,
+    stream: &StreamOut,
+    tp: crate::gpu::recomp::pso::TwoPass,
+    mesh_rs: *mut c_void,
+    mesh_samplers: &[crate::gpu::recomp::pso::StaticSampler],
+    kind: &'static str,
+    ms_hash: u64,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
-    let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
-    // the mesh pass and its compute pass: one turn for both
-    let bytes = stream.shader_bytes() + tp.cs.len();
-    let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
-    let waited = std::time::Instant::now();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
-    if gate {
-        crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated: {}, waited {} ms", _slot.is_some(), waited.elapsed().as_millis());
-    }
-    let hr = driver_compile(kind, stream.shader_bytes(), false, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv));
-    if hr < 0 {
-        note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
-        return E_INVALIDARG;
-    }
-    let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
-    let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
-    cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
-    cdesc.CS = bytecode(&tp.cs);
+    // the mesh pipeline from the driver's blob of an earlier build (this run or one on disk)
+    let mkey = mesh_blob_key(stream, mesh_samplers);
+    let mdisk = driver_cache::mesh_path(mkey.0, mkey.1);
+    let mcached = cached_mesh_blob(mkey, mdisk.as_deref());
     // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
     // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
     let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
@@ -5176,6 +5629,23 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     if cfrom_disk {
         ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
     }
+    // the mesh pass and its compute pass: one turn for both (none when both have a blob)
+    let bytes = stream.shader_bytes() + tp.cs.len();
+    let gate = !(mcached.0.is_some() && ccached.is_some()) && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let waited = std::time::Instant::now();
+    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
+    if gate {
+        crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated: {}, waited {} ms", _slot.is_some(), waited.elapsed().as_millis());
+    }
+    let (hr, _) = create_mesh_pso(stream, mkey, mcached, mdisk.as_deref(), COMPUTE_BLOB_MIN_DXIL, kind, ms_hash, ppv, |desc| finish_pso(this, fs, desc, riid, ppv));
+    if hr < 0 {
+        note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
+        return E_INVALIDARG;
+    }
+    let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+    cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+    cdesc.CS = bytecode(&tp.cs);
     if let Some(b) = &ccached {
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
@@ -5463,7 +5933,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             let _ = std::fs::write(f, ms);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", ms_hash, riid, ppv))
+    Some(finish_two_pass(this, &out, tp, rs, &ps_samplers, "MS", ms_hash, riid, ppv))
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
@@ -5534,7 +6004,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    finish_two_pass(this, &out, tp, rs, "GS", 0, riid, ppv)
+    finish_two_pass(this, &out, tp, rs, &ps_samplers, "GS", 0, riid, ppv)
 }
 
 /// A console MS container in the stream's AS subobject and no MS subobject (`mesh_shader_slots`).
