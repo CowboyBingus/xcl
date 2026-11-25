@@ -615,8 +615,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             let rec_bytes = (tp.record.record_dwords() as u64 * 4).max(4);
             let budget = (RES_BYTES / rec_bytes).saturating_mul(128).min(u64::from(super::indirect_clamp::BUDGET)) as u32;
             ei_peek(this, 3, max, args, args_off + u64::from(msig.mesh_offset), count_buf, count_off);
-            let bounded = super::indirect_clamp::bound_within(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off, budget);
-            if bounded.is_none() {
+            // lab: `XCL_TWO_PASS_UNBOUNDED=1`: the passes read the title's records as they are
+            static UNBOUNDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let unbounded = *UNBOUNDED.get_or_init(|| std::env::var_os("XCL_TWO_PASS_UNBOUNDED").is_some());
+            let bounded = if unbounded { None } else { super::indirect_clamp::bound_within(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off, budget) };
+            if bounded.is_none() && !unbounded {
                 // records we cannot bound could write past `res` and hang the GPU (0x887a0006)
                 count(DRAWS_SKIPPED);
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
