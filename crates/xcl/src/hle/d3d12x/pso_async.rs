@@ -292,10 +292,15 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, agai
 /// built while the title loads instead (`preload`): measured on a build that skips a dispatch
 /// instead of waiting for its pipeline, ~2 170 dispatches were skipped in those frames without
 /// this and 94 – 150 with it.
-mod used {
+pub(crate) mod used {
     use std::collections::HashSet;
     use std::io::Write;
     use std::sync::{Mutex, OnceLock, RwLock};
+
+    /// LOCAL (port of 354ce0c7): the keys of the pipelines earlier runs used, for `--used-only`.
+    pub fn earlier_used_keys() -> HashSet<u64> {
+        parse(&std::fs::read_to_string(crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt")).unwrap_or_default())
+    }
 
     struct Used {
         earlier: RwLock<HashSet<u64>>,

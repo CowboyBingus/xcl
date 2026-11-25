@@ -897,6 +897,12 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
         let sample = opt("--sample").unwrap_or(usize::MAX);
+        // LOCAL (port of 354ce0c7): `--used-only` passes over compute programs no earlier run used
+        let used = args.iter().any(|a| a == "--used-only").then(crate::hle::d3d12x::pso_async::used::earlier_used_keys);
+        if let Some(u) = &used {
+            println!("--used-only: {} pipelines earlier runs used (used-pipelines.txt)", u.len());
+        }
+        USED_ONLY.set(used).ok();
         return precompile(&input, opt("--limit").unwrap_or(usize::MAX), sample, windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
     }
     if args.iter().any(|a| a == "--direct") {
@@ -1282,6 +1288,9 @@ fn precompiled_compute(blob: &[u8], sh: &xbox::XboxShader, split: bool, windows:
     None
 }
 
+/// LOCAL (port of 354ce0c7): the `--used-only` keys, if given.
+static USED_ONLY: std::sync::OnceLock<Option<std::collections::HashSet<u64>>> = std::sync::OnceLock::new();
+
 #[allow(clippy::too_many_arguments)]
 fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
@@ -1337,6 +1346,13 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again; an MS
                 // as the compute pass of its two-pass pipelines (`pso::console_mesh_in`)
+                if let Some(Some(u)) = USED_ONLY.get() {
+                    let compute = sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_))));
+                    if compute && !u.contains(&crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()])) {
+                        done.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
                 if let Some(made) = precompiled_compute(&blob, &sh, split, windows) {
                     match made {
                         Ok((c, path)) => {
