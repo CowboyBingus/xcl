@@ -1187,6 +1187,9 @@ impl Lw {
                 }
                 out
             });
+            // (a V# on the constant data in the code: only with windows, where its high
+            // dword tells it from the title's memory)
+            let raw = if self.windowed() { self.rodata_loads(base_aligned, raw) } else { raw };
             let z = self.c(0);
             (0..count)
                 .map(|i| {
@@ -1204,7 +1207,7 @@ impl Lw {
             let a = self.add(b, k);
             let a = self.add(a, soff);
             let base_aligned = self.andc(a, !3);
-            self.with_mem_load_i32s(None, count as usize, &mut |lw, m, cond| {
+            let raw = self.with_mem_load_i32s(None, count as usize, &mut |lw, m, cond| {
                 let base_aligned = lw.safe_load_addr(base_aligned, cond);
                 let mut out = Vec::with_capacity(count as usize);
                 let mut done = 0u32;
@@ -1217,7 +1220,9 @@ impl Lw {
                     done += chunk;
                 }
                 out
-            })
+            });
+            // (constant data in the code)
+            self.rodata_loads(base_aligned, raw)
         };
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
         if self.split && coherent {
@@ -1939,6 +1944,13 @@ impl Lw {
         } else {
             let vd = Self::fv(d, "VDST");
             let loaded = self.mem_ld_n(Some(act), a, count as u32);
+            // (constant data in the code)
+            let loaded = if self.rodata.is_empty() {
+                loaded
+            } else {
+                let a = self.andc(a, !3);
+                self.rodata_loads(a, loaded)
+            };
             for i in 0..count {
                 self.write32(&Dst::V(vd + i), loaded[i as usize]);
             }

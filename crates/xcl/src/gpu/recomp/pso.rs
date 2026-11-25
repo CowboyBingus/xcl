@@ -777,20 +777,13 @@ pub(crate) fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    // the direct translator has no place for the constant data a program reads from its own
-    // code region (`Options::rodata`): such a program stays on the HLSL path
-    // lab: `XCL_RODATA_DIRECT=<record hash>,…` keeps these on the direct translator (their tables
-    // read zeros, as before): 56c0cd3b82a00c6e's HLSL is 30 MB and its 28 MB DXIL does not
-    // leave the driver's compiler in 25 minutes
-    static KEEP: OnceLock<Vec<u64>> = OnceLock::new();
-    let keep = KEEP.get_or_init(|| std::env::var("XCL_RODATA_DIRECT").map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()).unwrap_or_default());
-    if !f.rodata(p).is_empty() && takes_code_address(code) && !keep.contains(&crate::gpu::shader::fnv64(blob)) {
-        return Err("constant data in the code region (s_getpc_b64)".into());
-    }
+    // the constant data the program reads from its own code region (`Options::rodata`)
+    let rodata = f.rodata(p);
     let wave64 = super::detect_wave64(code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
-    if super::lower_dxil::enabled() {
+    // (and for a program that reads constant data in its code: the per-lane form has no table)
+    if super::lower_dxil::enabled() && !(!rodata.is_empty() && takes_code_address(code)) {
         match super::lower_dxil::compute_with(code, &cs, o) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("CS per-lane");
@@ -803,7 +796,7 @@ pub(crate) fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split
             }
         }
     }
-    let k = crate::gpu::dxil::kernel::translate_compute(code, o, &cs)?;
+    let k = crate::gpu::dxil::kernel::translate_entry_rodata(code, o, crate::gpu::dxil::kernel::Entry::Compute(cs), &rodata)?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
 }
@@ -834,11 +827,12 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::detect_wave64(code), split: false, mem_windows: windows, sampler_base };
-    let k = match (&mode, stage) {
-        (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs)?,
-        (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps)?,
+    let entry = match (&mode, stage) {
+        (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::Entry::Vertex(vs.clone()),
+        (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::Entry::Pixel(ps.clone()),
         _ => return Err("the shader stage does not match its slot in the PSO".into()),
     };
+    let k = crate::gpu::dxil::kernel::translate_entry_rodata(code, o, entry, &f.rodata(p))?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
 }
@@ -942,7 +936,7 @@ pub fn console_mesh_in(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool, windo
                 return Err("DXIL not compiled yet".into());
             }
             let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split, mem_windows: windows, sampler_base: 0 };
-            let k = crate::gpu::dxil::kernel::translate_mesh(code, o, ms)?;
+            let k = crate::gpu::dxil::kernel::translate_entry_rodata(code, o, crate::gpu::dxil::kernel::Entry::Mesh(ms.clone()), &f.rodata(p))?;
             crate::gpu::dxil::coverage::record_translated("MS");
             dump_direct(blob, &k.dxil);
             Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
