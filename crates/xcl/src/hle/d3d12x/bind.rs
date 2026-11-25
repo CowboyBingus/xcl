@@ -1884,11 +1884,28 @@ unsafe fn post_probe(this: *mut c_void, pso: usize) {
     let args = with(this, |s| s.args_gfx.clone());
     let word = |i: usize| args.get(4 * i..4 * i + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
     let (t0, t1) = (u.base() + word(0) as usize, u.base() + word(1) as usize);
+    // lab: a T# in a table is a copy of a heap slot's: its resource is the one of the slot of the
+    // title's bound view heap that holds the same index (word 0)
+    let heap = super::list_x::title_view_heap(this) as usize;
+    let resolve = |slot: usize| -> Option<usize> {
+        if let Some(r) = super::console_heap::resource_at(slot) {
+            return Some(r);
+        }
+        if heap == 0 || !crate::gpu::shader::readable(slot, 4) {
+            return None;
+        }
+        let w0 = (slot as *const u32).read_unaligned();
+        let mut n = 65536usize;
+        while n > 256 && !crate::gpu::shader::readable(heap, 32 * n) {
+            n /= 2;
+        }
+        (0..n).find(|&k| ((heap + 32 * k) as *const u32).read_unaligned() == w0 && super::console_heap::resource_at(heap + 32 * k).is_some()).and_then(|k| super::console_heap::resource_at(heap + 32 * k))
+    };
     // with `XCL_RT_DUMP`: the exposure texel, the LUTs (3-D: their first slice), the curve
     // and vignette textures, bloom and the scene go into the next dump as kind `s`
     if super::present::rt_dump_on() {
         for off in [0x380usize, 0x240, 0x300, 0xc0, 0x3e0, 0x2c0, 0x1c0, 0xa0, 0x4e0, 0x4c0] {
-            if let Some(r) = super::console_heap::resource_at(t1 + off) {
+            if let Some(r) = resolve(t1 + off) {
                 super::present::note_rt_dump(r, b's');
             }
         }
@@ -1911,7 +1928,7 @@ unsafe fn post_probe(this: *mut c_void, pso: usize) {
         format!("V# [{}] at {p:#x} win {:?} +{off:#x}: [{}]", hex(&v), p.checked_sub(u.base()).map(|d| d >> 32), hex(&cpu(p + off, n)))
     };
     let texture = |slot: usize| -> String {
-        let Some(r) = super::console_heap::resource_at(slot) else { return format!("no view (T# [{}])", hex(&cpu(slot, 8))) };
+        let Some(r) = resolve(slot) else { return format!("no view (T# [{}])", hex(&cpu(slot, 8))) };
         let d = ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| x.GetDesc());
         let mut s = d.map_or("?".to_string(), |d| format!("dim {} {}x{}x{} f{} mips {}", d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels));
         if super::vram::is_evicted(r) {
