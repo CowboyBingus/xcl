@@ -892,6 +892,13 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+    console_mesh_in(blob, ps, split_wave64, mem_windows())
+}
+
+/// `console_mesh` with the title's memory windows given (`xcl shaders --precompile` builds the
+/// compute passes without a title: the same DXIL, so the same driver blob keys, as at its run).
+/// The compute pass does not depend on `ps`; only the pass-through mesh shader does.
+pub fn console_mesh_in(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool, windows: u32) -> Result<TwoPass, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
     let mode = interface(blob, &sh, f).ok_or("unknown MS interface (e.g. lines / points)")?;
@@ -904,7 +911,6 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
     // (`ShaderCache` + in-flight coalescing) and on disk (`translated/v2`) across all `(MS, PS)`
     // pipelines that share this mesh shader (HLSL fallback on unsupported ops).
     if crate::gpu::dxil::kernel::enabled() {
-        let windows = mem_windows();
         let split = wave64 && split_wave64;
         let translate_ms = || {
             if dxc::defer() {
@@ -941,7 +947,7 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
             Err(e) => direct_fallback("MS", &e),
         }
     }
-    finish_two_pass(super::translate_mesh(code, ms.clone(), wave64, split_wave64, mem_windows())?, record, ps)
+    finish_two_pass(super::translate_mesh(code, ms.clone(), wave64, split_wave64, windows)?, record, ps)
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
