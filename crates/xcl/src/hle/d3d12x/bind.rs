@@ -529,7 +529,18 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             return;
         }
         let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-        let need = (groups as u64).saturating_mul(tp.record.record_dwords() as u64).saturating_mul(4);
+        // one record per group into `res` (a root UAV: no bounds check), whose size
+        // `ensure_res_buffer` caps at 128 MiB: groups past it would write past the buffer
+        let rec_bytes = (tp.record.record_dwords() as u64 * 4).max(4);
+        let fit = ((128u64 << 20) / rec_bytes).min(u64::from(u32::MAX)) as u32;
+        if groups > fit {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_warn!("D3D12.X: two-pass DispatchMesh of {groups} groups drawn as {fit}: the record buffer holds no more");
+            }
+        }
+        let groups = groups.min(fit);
+        let need = (groups as u64).saturating_mul(rec_bytes);
         let run = (|| -> Result<(), String> {
             let (res_buf, res_va) = ensure_res_buffer(this, need)?;
             bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
@@ -586,13 +597,27 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
             // the records bounded on the GPU first, as for other ExecuteIndirect calls below: a
             // garbage record hung the GPU here (0x887a0006). Both passes read the bounded copy.
-            let bounded = super::indirect_clamp::bound(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off);
+            // The compute pass writes one record per group into `res` (a root UAV: no bounds
+            // check), so the groups are also limited to the records the buffer holds.
+            const RES_BYTES: u64 = 64 << 20;
+            let rec_bytes = (tp.record.record_dwords() as u64 * 4).max(4);
+            let budget = (RES_BYTES / rec_bytes).saturating_mul(128).min(u64::from(super::indirect_clamp::BUDGET)) as u32;
+            let bounded = super::indirect_clamp::bound_within(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off, budget);
+            if bounded.is_none() {
+                // records we cannot bound could write past `res` and hang the GPU (0x887a0006)
+                count(DRAWS_SKIPPED);
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::xlog_warn!("D3D12.X: two-pass ExecuteIndirect skipped: its records could not be bounded");
+                }
+                return;
+            }
             let (args, args_off) = match &bounded {
                 Some(b) => (b.raw(), 0),
                 None => (args, args_off),
             };
             let run = (|| -> Result<(), String> {
-                let (res_buf, res_va) = ensure_res_buffer(this, 32 << 20)?;
+                let (res_buf, res_va) = ensure_res_buffer(this, RES_BYTES)?;
                 bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
                 pc(this, msig.companion_dispatch, max, args, args_off, count_buf, count_off);
                 emit_uav_barrier(list, Some(&res_buf));

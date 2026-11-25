@@ -11,7 +11,6 @@
 #define MAX_VERTEX_INSTANCES (1u << 26)
 #define MAX_GROUPS_DIM 65535u
 #define MAX_GROUPS (1u << 22)
-#define BUDGET (1u << 29)
 
 RWByteAddressBuffer source : register(u0);  // the UMA window holding the title's records
 RWByteAddressBuffer bounded : register(u1); // our copy, which ExecuteIndirect reads
@@ -24,6 +23,7 @@ cbuffer Config : register(b0) {
     uint action_at; // byte offset of the draw or dispatch arguments in a record
     uint kind;      // 0 draw, 1 indexed draw, 2 dispatch, 3 mesh dispatch
     uint count_at;  // byte offset of the count in `counts`; 0xFFFFFFFF: no count buffer
+    uint budget;    // work the whole call may ask for (threads; see clamp_args)
 };
 
 groupshared uint scan[THREADS];
@@ -78,7 +78,7 @@ void main(uint t : SV_GroupIndex) {
         }
         uint total = sat_add(carry, scan[t]);
         if (i < records) {
-            if (total > BUDGET) {
+            if (total > budget) {
                 if (kind <= 1)
                     a.y = 0;
                 else

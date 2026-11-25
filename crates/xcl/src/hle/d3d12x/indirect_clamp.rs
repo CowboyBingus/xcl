@@ -28,7 +28,9 @@ use super::real;
 
 /// Bytes of records one call may copy (larger calls run unbounded).
 const MAX_BYTES: u64 = 16 << 20;
-const CONFIG_WORDS: u32 = 6;
+const CONFIG_WORDS: u32 = 7;
+/// work one call may ask for, in threads (a group counts as 64, a mesh group as 128)
+pub(super) const BUDGET: u32 = 1 << 29;
 const NO_COUNT: u32 = u32::MAX;
 
 pub(super) fn enabled() -> bool {
@@ -226,8 +228,8 @@ unsafe fn in_window(res: usize, offset: u64, bytes: u64) -> Option<(u64, u32)> {
 }
 
 /// The config words for a call: max records, where they are, the signature and the count.
-fn config(sig: Signature, max: u32, source_at: u32, count_at: Option<u32>) -> [u32; CONFIG_WORDS as usize] {
-    [max, source_at, sig.stride, sig.action_at, sig.kind, count_at.unwrap_or(NO_COUNT)]
+fn config(sig: Signature, max: u32, source_at: u32, count_at: Option<u32>, budget: u32) -> [u32; CONFIG_WORDS as usize] {
+    [max, source_at, sig.stride, sig.action_at, sig.kind, count_at.unwrap_or(NO_COUNT), budget]
 }
 
 unsafe fn transition(list: &ID3D12GraphicsCommandList, r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
@@ -271,6 +273,15 @@ impl Bounded {
 pub(super) unsafe fn bound(
     list: &ID3D12GraphicsCommandList, allocator: usize, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64,
 ) -> Option<Bounded> {
+    bound_within(list, allocator, sig, max, args, args_off, count_buf, count_off, BUDGET)
+}
+
+/// [`bound`] with the call's work limited to `budget` threads (a mesh group counts as 128):
+/// a two-pass mesh call writes one record per group into a buffer of fixed size.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn bound_within(
+    list: &ID3D12GraphicsCommandList, allocator: usize, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64, budget: u32,
+) -> Option<Bounded> {
     if !enabled() || max == 0 {
         return None;
     }
@@ -293,7 +304,7 @@ pub(super) unsafe fn bound(
     let dev = dev?;
     let c = clamper(&dev)?;
     let out = scratch(&dev, allocator, bytes)?;
-    let cfg = config(s, max, source_at, count_at);
+    let cfg = config(s, max, source_at, count_at, budget);
     // the title's writes to its records (through any view) before our reads
     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() }]);
     list.SetPipelineState(&c.pso);
@@ -353,8 +364,9 @@ mod tests {
     #[test]
     fn config_words_follow_the_shader() {
         let s = Signature { stride: 52, action_at: 32, kind: 1 };
-        assert_eq!(config(s, 7, 128, Some(64)), [7, 128, 52, 32, 1, 64]);
-        assert_eq!(config(s, 7, 128, None)[5], NO_COUNT);
+        assert_eq!(config(s, 7, 128, Some(64), BUDGET), [7, 128, 52, 32, 1, 64, BUDGET]);
+        assert_eq!(config(s, 7, 128, None, 99)[5], NO_COUNT);
+        assert_eq!(config(s, 7, 128, None, 99)[6], 99);
     }
 
     /// The shader on the GPU: clamped records, and records past the budget emptied; everything
@@ -421,7 +433,7 @@ mod tests {
             list.CopyBufferRegion(&src, 0, &upload, 0, bytes);
             transition(&list, &src, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             let s = Signature { stride, action_at: 16, kind: 1 };
-            let cfg = config(s, n, 0, Some(stride * n));
+            let cfg = config(s, n, 0, Some(stride * n), BUDGET);
             list.SetPipelineState(&c.pso);
             list.SetComputeRootSignature(&c.root);
             list.SetComputeRootUnorderedAccessView(0, src.GetGPUVirtualAddress());
