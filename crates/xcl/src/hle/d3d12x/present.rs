@@ -838,7 +838,11 @@ fn frame_dump_due() -> bool {
         Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
         Err(_) => 0,
     });
-    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+    // lab: `XCL_FRAME_DUMP_FROM=n`: every shown frame from the n-th on
+    static FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let from = *FROM.get_or_init(|| std::env::var("XCL_FRAME_DUMP_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX));
+    let n = PRESENTS.load(Ordering::Relaxed);
+    n >= from || every > 0 && n % every == 20.min(every - 1)
 }
 
 /// Frames shown so far.

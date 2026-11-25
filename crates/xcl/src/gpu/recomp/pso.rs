@@ -779,7 +779,12 @@ pub(crate) fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split
     let code = &f.data[p.offset..p.offset + p.len];
     // the direct translator has no place for the constant data a program reads from its own
     // code region (`Options::rodata`): such a program stays on the HLSL path
-    if !f.rodata(p).is_empty() && takes_code_address(code) {
+    // lab: `XCL_RODATA_DIRECT=<record hash>,…` keeps these on the direct translator (their tables
+    // read zeros, as before): 56c0cd3b82a00c6e's HLSL is 30 MB and its 28 MB DXIL does not
+    // leave the driver's compiler in 25 minutes
+    static KEEP: OnceLock<Vec<u64>> = OnceLock::new();
+    let keep = KEEP.get_or_init(|| std::env::var("XCL_RODATA_DIRECT").map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()).unwrap_or_default());
+    if !f.rodata(p).is_empty() && takes_code_address(code) && !keep.contains(&crate::gpu::shader::fnv64(blob)) {
         return Err("constant data in the code region (s_getpc_b64)".into());
     }
     let wave64 = super::detect_wave64(code);
