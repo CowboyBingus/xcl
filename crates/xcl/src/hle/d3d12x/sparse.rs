@@ -1008,11 +1008,23 @@ impl State {
         if target == 0 || super::real::fence_completed(&self.fence) >= target {
             return;
         }
-        let _ = self.fence.SetEventOnCompletion(target, self.event);
-        windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-        if super::real::fence_completed(&self.fence) < target {
-            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", super::real::fence_completed(&self.fence));
+        // The event is one for all waits here, and a wait that gave up leaves its registration
+        // behind: that one sets the event later, and the next wait would return at once with the
+        // queue not there (10 such "after 5 s" lines within 100 ms in one run, each followed by a
+        // Reset of an allocator the GPU was still in). So: until the fence says so, or 5 s.
+        let t0 = std::time::Instant::now();
+        loop {
+            let _ = self.fence.SetEventOnCompletion(target, self.event);
+            let left = 5000u64.saturating_sub(t0.elapsed().as_millis() as u64).max(1) as u32;
+            windows::Win32::System::Threading::WaitForSingleObject(self.event, left);
+            if super::real::fence_completed(&self.fence) >= target {
+                return;
+            }
+            if t0.elapsed().as_millis() >= 5000 {
+                break;
+            }
         }
+        crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", super::real::fence_completed(&self.fence));
     }
 
     #[inline]
@@ -1329,9 +1341,8 @@ impl State {
                     break;
                 }
                 // the title's lists are done: only the copy itself is left
-                let _ = done.SetEventOnCompletion(done_v, self.event);
-                windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-                if super::real::fence_completed(&done) < done_v {
+                // (`wait_fence`'s own event: `self.event` is the tile queue's, see `wait_for`)
+                if !wait_fence(&done, done_v) {
                     crate::xlog_warn!("sparse: a copy back has not finished 5 s after the title's work it follows");
                     break;
                 }
