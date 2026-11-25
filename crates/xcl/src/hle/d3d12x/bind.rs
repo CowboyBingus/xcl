@@ -1891,10 +1891,16 @@ unsafe fn post_probe(this: *mut c_void, pso: usize) {
         if let Some(r) = super::console_heap::resource_at(slot) {
             return Some(r);
         }
-        if heap == 0 || !crate::gpu::shader::readable(slot, 4) {
+        if !crate::gpu::shader::readable(slot, 4) {
             return None;
         }
         let w0 = (slot as *const u32).read_unaligned();
+        if let Some(r) = super::console_heap::resource_by_word0(w0) {
+            return Some(r);
+        }
+        if heap == 0 {
+            return None;
+        }
         let mut n = 65536usize;
         while n > 256 && !crate::gpu::shader::readable(heap, 32 * n) {
             n /= 2;

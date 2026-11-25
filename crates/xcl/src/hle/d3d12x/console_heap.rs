@@ -423,6 +423,13 @@ pub fn note_resource(s: &Slot, res: usize) {
 }
 
 /// The resource of the view slot at UMA address `at`.
+/// lab: the resource of any slot whose descriptor's word 0 (the PC index a T# keeps wherever the
+/// title copies it) is `w0`.
+pub fn resource_by_word0(w0: u32) -> Option<usize> {
+    let g = RES.lock().unwrap();
+    g.as_ref()?.iter().find(|(&at, _)| crate::gpu::shader::readable(at, 4) && unsafe { (at as *const u32).read_unaligned() } == w0).map(|(_, &r)| r)
+}
+
 pub fn resource_at(at: usize) -> Option<usize> {
     RES.lock().unwrap().as_ref()?.get(&at).copied()
 }
