@@ -614,6 +614,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             let RES_BYTES: u64 = *RES_MB.get_or_init(|| std::env::var("XCL_TWO_PASS_RES_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(32u64).clamp(1, 128)) << 20;
             let rec_bytes = (tp.record.record_dwords() as u64 * 4).max(4);
             let budget = (RES_BYTES / rec_bytes).saturating_mul(128).min(u64::from(super::indirect_clamp::BUDGET)) as u32;
+            ei_peek(this, 3, max, args, args_off + u64::from(msig.mesh_offset), count_buf, count_off);
             let bounded = super::indirect_clamp::bound_within(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off, budget);
             if bounded.is_none() {
                 // records we cannot bound could write past `res` and hang the GPU (0x887a0006)
@@ -747,7 +748,7 @@ struct EiPeek {
 }
 unsafe impl Send for EiPeek {}
 static EI_PEEK: Mutex<Option<EiPeek>> = Mutex::new(None);
-const EI_PEEK_SLOTS: usize = 4096;
+const EI_PEEK_SLOTS: usize = 32768;
 
 fn ei_peek_from() -> Option<f64> {
     static T: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
@@ -757,6 +758,13 @@ fn ei_peek_from() -> Option<f64> {
 unsafe fn ei_peek(this: *mut c_void, kind: u8, max: u32, args: usize, args_at: u64, count_buf: usize, count_off: u64) {
     let Some(from) = ei_peek_from() else { return };
     if crate::log::uptime() < from || args == 0 {
+        return;
+    }
+    // every n-th call of a kind (`XCL_EI_PEEK_EVERY`, default 4)
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static CALLS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    let every = *EVERY.get_or_init(|| std::env::var("XCL_EI_PEEK_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64).max(1));
+    if CALLS[kind as usize & 3].fetch_add(1, Ordering::Relaxed) % every != 0 {
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
@@ -790,7 +798,7 @@ unsafe fn ei_peek(this: *mut c_void, kind: u8, max: u32, args: usize, args_at: u
         }
         *g = Some(EiPeek { rb, meta: Vec::new() });
         let _ = std::thread::Builder::new().name("xcl-ei-peek".into()).spawn(|| {
-            for wait in [8u64, 8, 14] {
+            for wait in [8u64, 8, 14, 15, 15, 20, 20, 30] {
                 std::thread::sleep(std::time::Duration::from_secs(wait));
                 ei_peek_report();
             }
@@ -824,37 +832,33 @@ fn ei_peek_report() {
             return;
         }
         let w = |slot: usize, k: usize| (p as *const u32).add(slot * 8 + k).read_unaligned();
-        for kind in 0..3u8 {
-            let (mut n, mut pending, mut zero_args, mut zero_count, mut groups) = (0u32, 0u32, 0u32, 0u32, 0u64);
-            let mut examples = Vec::new();
-            for (slot, &(t, k, max, has_count)) in pk.meta.iter().enumerate() {
-                if k != kind {
-                    continue;
-                }
-                n += 1;
-                let (x, y, z, c) = (w(slot, 0), w(slot, 1), w(slot, 2), w(slot, 4));
-                if x == 0xEEEE_EEEE {
-                    pending += 1;
-                    continue;
-                }
-                let empty = if kind == 2 || kind == 0 { x == 0 || y == 0 || z == 0 } else { x == 0 || y == 0 };
-                if empty {
-                    zero_args += 1;
-                }
-                if has_count && c == 0 {
-                    zero_count += 1;
-                }
-                if !empty && !(has_count && c == 0) {
-                    groups += x as u64 * if kind == 1 { y as u64 } else { y as u64 * z as u64 };
-                }
-                if examples.len() < 40 && (slot % 7 == 0 || !empty) {
-                    examples.push(format!("{t:.1}s max {max} [{x:#x} {y:#x} {z:#x}]{}", if has_count { format!(" count {c:#x}") } else { String::new() }));
-                }
+        // (kind, 4 s bucket) -> (calls, not run yet, empty arguments, count 0, work, examples)
+        let mut rows: std::collections::BTreeMap<(u8, u64), (u32, u32, u32, u32, u64, Vec<String>)> = Default::default();
+        for (slot, &(t, kind, max, has_count)) in pk.meta.iter().enumerate() {
+            let row = rows.entry((kind, (t / 4.0) as u64 * 4)).or_default();
+            row.0 += 1;
+            let (x, y, z, c) = (w(slot, 0), w(slot, 1), w(slot, 2), w(slot, 4));
+            if x == 0xEEEE_EEEE {
+                row.1 += 1;
+                continue;
             }
-            crate::xlog_info!(
-                "ei peek: kind {kind} (0 two-pass mesh, 1 graphics, 2 compute): {n} calls, {pending} not run yet, {zero_args} with empty arguments, {zero_count} with count 0, work of the rest {groups}; {}",
-                examples.join("; ")
-            );
+            let empty = if kind == 1 { x == 0 || y == 0 } else { x == 0 || y == 0 || z == 0 };
+            if empty {
+                row.2 += 1;
+            }
+            if has_count && c == 0 {
+                row.3 += 1;
+            }
+            if !empty && !(has_count && c == 0) {
+                row.4 += x as u64 * if kind == 1 { y as u64 } else { y as u64 * z as u64 };
+            }
+            if row.5.len() < 10 && (!empty || row.0 % 97 == 1) {
+                row.5.push(format!("max {max} [{x:#x} {y:#x} {z:#x}]{}", if has_count { format!(" count {c:#x}") } else { String::new() }));
+            }
+        }
+        crate::xlog_info!("ei peek: {} calls sampled (kind 0 two-pass mesh bounded, 1 graphics, 2 compute, 3 two-pass mesh as the title wrote them)", pk.meta.len());
+        for ((kind, t), (n, pending, empty, zero_count, work, examples)) in rows {
+            crate::xlog_info!("ei peek: kind {kind} at {t}-{} s: {n} calls, {pending} not run yet, {empty} with empty arguments, {zero_count} with count 0, work of the rest {work}; {}", t + 4, examples.join("; "));
         }
         pk.rb.Unmap(0, None);
     }
