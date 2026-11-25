@@ -1441,6 +1441,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
     }
+    post_probe(this, pso);
     match bind_abi(this, &list, pso, true) {
         Ok(()) => {
             super::targets::note_draw(this, super::targets::RAN);
@@ -1847,6 +1848,117 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
         }
         None => std::ptr::null_mut(),
     }
+}
+
+/// lab: `XCL_POST_PROBE=<seconds>` – from then on, what the tone-map draw reads, as the CPU
+/// sees it (24 times, every 4th draw of PS_Composite 8d7a9eda9b47fd27 / PS_CompositeNMB
+/// 4adcdc125462510a; `XCL_POST_PROBE_HASH` = another PS). The program (disassembly in
+/// scratchpad\agents\exposure\rec): s8 = the frame's table, s9 = the pass's table.
+/// - its constants (V# at s9 + 0x540): +0x514 != 0 chooses the LUT path (scene x exposure,
+///   bloom, 3-D LUT at +0x240, then the output LUT at +0x3e0), 0 the curve of the buffer at
+///   +0x20 (written by PS_CalculateExposure with a pixel-shader UAV store);
+/// - the exposure is texel (0, 0) of the 1x1 RGBA32F target at s9 + 0x380 (written by
+///   PS_CalculateExposure / PS_ResetExposure: x = exposure, y = its log2), loaded by the VERTEX
+///   shader (VS_PassthroughComposite) and passed down as TEXCOORD0.z (the LUT path multiplies
+///   the scene by it: 0 there = a constant image) and TEXCOORD1.x (log2, the curve path);
+/// - the pre-exposure scalar is dword 0 of the buffer at s8 + 0x80.
+/// Per texture: size, format, evicted, and the state of a texture kept in step. With
+/// `XCL_RT_DUMP` the textures it samples are dumped too (`rtd_<present>_<k>_s_...`): the raw
+/// texel of the 1x1 exposure target is in the "most common" list (w z y x, x = exposure).
+unsafe fn post_probe(this: *mut c_void, pso: usize) {
+    static CFG: std::sync::OnceLock<Option<(f64, Option<u64>)>> = std::sync::OnceLock::new();
+    let Some((from, only)) = *CFG.get_or_init(|| {
+        let from = std::env::var("XCL_POST_PROBE").ok()?.trim().parse().ok()?;
+        Some((from, std::env::var("XCL_POST_PROBE_HASH").ok().and_then(|v| u64::from_str_radix(v.trim(), 16).ok())))
+    }) else {
+        return;
+    };
+    if crate::log::uptime() < from {
+        return;
+    }
+    let Some((vs, ps)) = super::real::pso_shaders(super::pso_async::resolve(pso)) else { return };
+    if !only.map_or(matches!(ps, 0x8d7a_9eda_9b47_fd27 | 0x4adc_dc12_5462_510a), |h| h == ps) {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let args = with(this, |s| s.args_gfx.clone());
+    let word = |i: usize| args.get(4 * i..4 * i + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    let (t0, t1) = (u.base() + word(0) as usize, u.base() + word(1) as usize);
+    // with `XCL_RT_DUMP`: the exposure texel, the LUTs (3-D: their first slice), the curve
+    // and vignette textures, bloom and the scene go into the next dump as kind `s`
+    if super::present::rt_dump_on() {
+        for off in [0x380usize, 0x240, 0x300, 0xc0, 0x3e0, 0x2c0, 0x1c0, 0xa0, 0x4e0, 0x4c0] {
+            if let Some(r) = super::console_heap::resource_at(t1 + off) {
+                super::present::note_rt_dump(r, b's');
+            }
+        }
+    }
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if CALLS.fetch_add(1, Ordering::Relaxed) % 4 != 0 || LOGGED.fetch_add(1, Ordering::Relaxed) >= 24 {
+        return;
+    }
+    let cpu = |p: usize, n: usize| -> Option<Vec<u32>> {
+        crate::gpu::shader::readable(p, 4 * n).then(|| (0..n).map(|i| ((p + 4 * i) as *const u32).read_unaligned()).collect())
+    };
+    let hex = |v: &Option<Vec<u32>>| v.as_ref().map_or("unreadable".to_string(), |v| v.iter().map(|x| format!("{x:x}")).collect::<Vec<_>>().join(" "));
+    // a V#: its words, where its bytes are (a 32-bit address is in window 0) and the first `n` dwords from `off`
+    let buffer = |slot: usize, off: usize, n: usize| -> String {
+        let v = cpu(slot, 4);
+        let Some(w) = &v else { return "V# unreadable".into() };
+        let a = (u64::from(w[1] & 0xFFFF) << 32) | u64::from(w[0]);
+        let p = if a >> 32 == 0 { u.base() + a as usize } else { a as usize };
+        format!("V# [{}] at {p:#x} win {:?} +{off:#x}: [{}]", hex(&v), p.checked_sub(u.base()).map(|d| d >> 32), hex(&cpu(p + off, n)))
+    };
+    let texture = |slot: usize| -> String {
+        let Some(r) = super::console_heap::resource_at(slot) else { return format!("no view (T# [{}])", hex(&cpu(slot, 8))) };
+        let d = ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| x.GetDesc());
+        let mut s = d.map_or("?".to_string(), |d| format!("dim {} {}x{}x{} f{} mips {}", d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels));
+        if super::vram::is_evicted(r) {
+            s += " EVICTED";
+        }
+        if let Some((va, src, pending, gpu_written, unmapped, shadowed)) = super::title_textures::probe_state(r) {
+            s += &format!(" kept at {va:#x} src {src:#x} pending {pending} gpu-written {gpu_written} unmapped {unmapped} shadowed {shadowed}");
+        }
+        s
+    };
+    let rt = super::present::rt0_resource(this as usize).and_then(|r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0) }));
+    crate::xlog_info!("post probe: vs {vs:016x} ps {ps:016x} into {rt:?} at {:.1} s: s8 {:#x} s9 {:#x}; pre-exposure (s8+0x80) {}; frame constants (s8+0xc0) {}", crate::log::uptime(), word(0), word(1), buffer(t0 + 0x80, 0, 4), buffer(t0 + 0xc0, 0x5f0, 1));
+    let cb = t1 + 0x540;
+    crate::xlog_info!(
+        "post probe: constants {} | +0x40 {} | +0x220 {} | +0x3c0 {} | +0x3e0 {} | +0x400 {} | +0x480 {} | +0x500 {}",
+        buffer(cb, 0, 4),
+        buffer(cb, 0x40, 2),
+        buffer(cb, 0x220, 4),
+        buffer(cb, 0x3c0, 5),
+        buffer(cb, 0x3e0, 4),
+        buffer(cb, 0x400, 12),
+        buffer(cb, 0x480, 8),
+        buffer(cb, 0x500, 18)
+    );
+    crate::xlog_info!("post probe: buffers: +0x0 {} | +0x20 (curve) {} | +0x60 {} | +0x500 {} | +0x520 {}", buffer(t1, 0, 8), buffer(t1 + 0x20, 0, 8), buffer(t1 + 0x60, 0, 16), buffer(t1 + 0x500, 0, 16), buffer(t1 + 0x520, 0, 20));
+    let names = [
+        (0x380, "exposure 1x1 (VS)"),
+        (0x4c0, "scene"),
+        (0x400, "scene lz"),
+        (0x80, "image_load"),
+        (0x480, "blurred"),
+        (0x100, "local"),
+        (0x1c0, "curve lut"),
+        (0x4a0, "grid a"),
+        (0x3a0, "grid b"),
+        (0x4e0, "bloom"),
+        (0x2c0, "splines"),
+        (0x240, "LUT 1"),
+        (0x300, "LUT 1b"),
+        (0xc0, "LUT 1c"),
+        (0x460, "LUT mask"),
+        (0x3e0, "LUT 2 (output)"),
+        (0xa0, "vignette"),
+        (0x420, "overlay"),
+    ];
+    let t: Vec<String> = names.iter().map(|&(off, name)| format!("{name} +{off:#x}: {}", texture(t1 + off))).collect();
+    crate::xlog_info!("post probe: textures: {} | s8+0x2a0 noise: {}", t.join(" | "), texture(t0 + 0x2a0));
 }
 
 /// lab: `XCL_DISPATCH_PROBE=<seconds>` – from then on, once per compute pipeline (up to 800):
