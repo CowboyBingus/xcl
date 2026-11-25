@@ -443,7 +443,34 @@ fn sample(counted: bool) -> GamepadState {
         super::kbm::apply,
         || scripted(counted),
     );
+    scripted_sticks(&mut s);
     s
+}
+
+/// LOCAL TEST (not for a PR): `XCL_STICK_AT=s:dur:L|R:x:y,...` holds a stick at (x, y) in -1..1 for `dur`
+/// seconds from `s` (host uptime, as `XCL_PRESS_AT`), e.g. `600:3:L:0:1` walks forward for 3 s.
+fn scripted_sticks(s: &mut GamepadState) {
+    static SCRIPT: LazyLock<Vec<(f64, f64, bool, f32, f32)>> = LazyLock::new(|| {
+        std::env::var("XCL_STICK_AT")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|e| {
+                let f: Vec<&str> = e.trim().split(':').collect();
+                let [at, dur, stick, x, y] = f.as_slice() else { return None };
+                Some((at.parse().ok()?, dur.parse().ok()?, stick.eq_ignore_ascii_case("L"), x.parse().ok()?, y.parse().ok()?))
+            })
+            .collect()
+    });
+    let t = crate::log::uptime();
+    for &(at, dur, left, x, y) in SCRIPT.iter() {
+        if t >= at && t < at + dur {
+            if left {
+                (s.left_x, s.left_y) = (x, y);
+            } else {
+                (s.right_x, s.right_y) = (x, y);
+            }
+        }
+    }
 }
 
 /// the first presses of each button the title was handed: worth a line (is input arriving at all?)
