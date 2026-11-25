@@ -63,6 +63,7 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
 
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
+    super::targets::frame_end();
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
         static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -200,6 +201,15 @@ pub fn is_presented(res: usize) -> bool {
 /// the resource an RTV handle names (render-target binds)
 pub fn rtv_resource(handle: usize) -> Option<usize> {
     RTVS.lock().unwrap().as_ref()?.get(&handle).copied()
+}
+
+/// The resource `r` while a view still names it (AddRef'd), for `XCL_DUMP_TARGETS`.
+pub(super) unsafe fn view_resource(r: usize) -> Option<ID3D12Resource> {
+    let g = RTVS.lock().unwrap();
+    if !g.as_ref()?.values().any(|&v| v == r) {
+        return None;
+    }
+    ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).cloned()
 }
 
 /// The resource bound as render target 0 on `list` (`XCL_TRACE_FRAME`).
@@ -695,8 +705,18 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
     p.list.ResourceBarrier(&b1);
     p.list.CopyResource(&bb, &src);
-    let due = frame_dump_due();
+    // `XCL_DUMP_TARGETS`: a busy frame's render targets go with its picture (copied in the
+    // state the title left them, as `XCL_TRACE_FRAME`'s; its frame dump is also the
+    // `last_frame_dump` of the report)
+    let targets = super::targets::take_pending();
+    let dumping_targets = targets.is_some();
+    let due = frame_dump_due() || dumping_targets;
     let mut dumps = Vec::new();
+    for (tag, res, d) in targets.map_or(Vec::new(), |f| super::targets::to_dump(PRESENTS.load(Ordering::Relaxed), &f)) {
+        if let Some((buffer, footprint)) = readback_copy(&p.list, &res, &d) {
+            dumps.push(FrameDump { _source: res, buffer, footprint, format: d.Format, tag });
+        }
+    }
     if due {
         if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
             dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
@@ -744,6 +764,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         crate::xlog_error!("present: submit copy: {e}");
         return;
     }
+    if dumping_targets {
+        super::targets::submitted();
+    }
     if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
@@ -755,6 +778,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
+                    if dump.tag.starts_with("target") {
+                        super::targets::log_census(&dump.buffer, &dump.footprint, &dump.tag);
+                    }
                     write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
                 }
             }
