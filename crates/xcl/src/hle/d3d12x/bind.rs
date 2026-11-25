@@ -826,6 +826,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         Some(b) => ei_peek(this, if gfx { 1 } else { 2 }, max, b.raw(), 0, count_buf, count_off),
         None => ei_peek(this, if gfx { 1 } else { 2 }, max, args, args_off, count_buf, count_off),
     }
+    if compute && !gfx {
+        // lab: indirect dispatches in the probes too (groups: u32::MAX, max count, 0)
+        dispatch_probe(this, pso, [u32::MAX, max, 0]);
+        rt_dump_note_compute(this);
+    }
     let result = bind_abi(this, list, pso, gfx);
     if let Ok(()) = result {
         ei_work(this, sig, super::targets::RAN);
@@ -2102,11 +2107,44 @@ unsafe fn dispatch_probe(this: *mut c_void, pso: usize, groups: [u32; 3]) {
     crate::xlog_info!("dispatch probe: cs {cs:016x} groups {groups:?} at {:.1} s: {}", crate::log::uptime(), res.join(", "));
 }
 
+/// lab (`XCL_RT_DUMP`): within a second before a dump is due, the textures in the first 64
+/// slots of a compute dispatch's descriptor tables go into the dump as kind `u` (what compute
+/// passes read and write: light lists, probe atlases, volumes), whatever their size.
+unsafe fn rt_dump_note_compute(this: *mut c_void) {
+    if !super::present::rt_dump_due_soon() {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let (layout, args) = with(this, |s| (s.layout.clone(), s.args.clone()));
+    let Some(layout) = layout else { return };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    for p in layout.params.iter() {
+        let Param::Table { at } = *p else { continue };
+        let v = word(at as usize).unwrap_or(0);
+        if v == 0 {
+            continue;
+        }
+        let t = u.base() + v as usize;
+        for k in 0..64usize {
+            let slot = t + 32 * k;
+            if !crate::gpu::shader::readable(slot, 32) {
+                break;
+            }
+            let w0 = (slot as *const u32).read_unaligned();
+            let r = super::console_heap::resource_at(slot).or_else(|| (w0 != 0).then(|| super::console_heap::resource_by_word0(w0)).flatten());
+            if let Some(r) = r {
+                super::present::note_rt_dump(r, b'u');
+            }
+        }
+    }
+}
+
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }
     dispatch_probe(this, pso, [x, y, z]);
+    rt_dump_note_compute(this);
     bind_abi(this, list, pso, false)?;
     list.Dispatch(x, y, z);
     Ok(())

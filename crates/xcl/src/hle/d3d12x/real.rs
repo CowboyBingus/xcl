@@ -2357,6 +2357,11 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view");
             }
+            // lab: which resource and view
+            if N.load(Ordering::Relaxed) <= 64 {
+                let d = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
+                crate::xlog_info!("lab: null UAV: resource {res:p} {:?}, view {:?}, slot at {at:#x}", d.map(|d| (d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0, d.Flags.0)), desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0)));
+            }
             f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
         } else {
             f(this, res, counter, desc, at)

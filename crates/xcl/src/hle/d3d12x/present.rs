@@ -750,6 +750,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         let n = PRESENTS.load(Ordering::Relaxed);
         crate::xlog_info!("rt dump: present {n} at {:.1} s, {} resources written since the previous present", crate::log::uptime(), set.len());
         let mut taken = 0;
+        // readback bytes so far (the copies are in RAM until written): at most 1.5 GB a dump
+        let mut bytes = 0u64;
         for (k, &(r, kind)) in set.iter().enumerate() {
             let rr = r as *mut c_void;
             let Some(res) = ID3D12Resource::from_raw_borrowed(&rr).cloned() else { continue };
@@ -757,13 +759,14 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             // lab (`XCL_POST_PROBE`): kind `s` = sampled by the tone-map draw: whatever its size.
             // A 3-D texture (the colour LUTs): its first slice. A 1x1 / 2x2 target (the exposure) always.
             let shape = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || (kind == b's' && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D);
-            let small = d.Width < 128 && d.Width * d.Height as u64 > 4 && kind != b's';
-            if !shape || d.SampleDesc.Count > 1 || small || taken >= 80 {
+            let small = d.Width < 128 && d.Width * d.Height as u64 > 4 && kind != b's' && kind != b'u';
+            if !shape || d.SampleDesc.Count > 1 || small || taken >= 300 || bytes > 1500 << 20 {
                 crate::xlog_info!("rt dump: {k} {} not copied: dimension {} {}x{} format {} samples {}", kind as char, d.Dimension.0, d.Width, d.Height, d.Format.0, d.SampleDesc.Count);
                 continue;
             }
             if let Some((buffer, footprint)) = readback_copy(&p.list, &res, &d) {
                 taken += 1;
+                bytes += footprint.Footprint.RowPitch as u64 * footprint.Footprint.Height as u64;
                 dumps.push(FrameDump { _source: res, buffer, footprint, format: d.Format, tag: format!("rtd_{n}_{k:03}_{}", kind as char) });
             }
         }
@@ -987,6 +990,12 @@ pub fn rt_dump_on() -> bool {
     !rt_dump_times().is_empty()
 }
 
+/// lab: the next dump is due within a second (or already due)
+pub fn rt_dump_due_soon() -> bool {
+    let done = RT_DUMPS_DONE.load(Ordering::Relaxed) as usize;
+    rt_dump_times().get(done).is_some_and(|&t| crate::log::uptime() >= t - 1.0)
+}
+
 /// (resource, kind) in first-use order, AddRef'd until the next present
 static RT_DUMP_SET: Mutex<Vec<(usize, u8)>> = Mutex::new(Vec::new());
 /// DSV handle → resource (not AddRef'd: looked at only while the title binds it)
@@ -1009,7 +1018,7 @@ pub unsafe fn note_rt_dump(res: usize, kind: u8) {
         return;
     }
     let mut g = RT_DUMP_SET.lock().unwrap();
-    if g.len() >= 256 || g.iter().any(|&(r, _)| r == res) {
+    if g.len() >= 700 || g.iter().any(|&(r, _)| r == res) {
         return;
     }
     add_ref(res);
@@ -1133,6 +1142,9 @@ unsafe fn write_rt(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     }
     let mut raw: HashMap<Vec<u8>, usize> = HashMap::new();
     let (mut sum, mut alpha_sum, mut alpha_n) = ([0f64; 3], 0f64, 0usize);
+    // lab: for the float formats, the luminance of each sampled texel with the view curve undone
+    let hdr = matches!(fp.Footprint.Format.0, 1..=4 | 9 | 10 | 26);
+    let mut lum: Vec<f32> = Vec::new();
     for y in (0..oh).rev() {
         let start = bmp.len();
         for x in 0..ow {
@@ -1143,6 +1155,10 @@ unsafe fn write_rt(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
             let c = decode(t);
             for k in 0..3 {
                 sum[k] += c[k] as f64;
+            }
+            if hdr {
+                let inv = |v: f32| if v.is_nan() { f32::NAN } else { let q = (v * v).min(0.999_999); q / (1.0 - q) };
+                lum.push(0.2126 * inv(c[0]) + 0.7152 * inv(c[1]) + 0.0722 * inv(c[2]));
             }
             if matches!(fp.Footprint.Format.0, 27..=32) {
                 alpha_sum += t[3] as f64;
@@ -1158,6 +1174,21 @@ unsafe fn write_rt(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     let path = boot.logs_dir().join(format!("{tag}_{w}x{h}_f{}.bmp", format.0));
     let _ = std::fs::write(&path, &bmp);
     let px = (ow * oh) as f64;
+    if hdr && !lum.is_empty() {
+        let nan = lum.iter().filter(|v| v.is_nan()).count();
+        let mut l: Vec<f32> = lum.into_iter().filter(|v| !v.is_nan()).collect();
+        l.sort_by(|a, b| a.total_cmp(b));
+        let black = l.iter().filter(|&&v| v == 0.0).count();
+        let at = |q: f64| l.get(((l.len() as f64 - 1.0) * q) as usize).copied().unwrap_or(0.0);
+        let mean = l.iter().map(|&v| v as f64).sum::<f64>() / l.len().max(1) as f64;
+        crate::xlog_info!(
+            "rt dump: {tag} linear luminance: black {:.1} %, NaN {nan}, median {:.4e}, p90 {:.4e}, p99 {:.4e}, mean {mean:.4e}",
+            100.0 * black as f64 / px,
+            at(0.5),
+            at(0.9),
+            at(0.99)
+        );
+    }
     let mut top: Vec<(Vec<u8>, usize)> = raw.into_iter().collect();
     let distinct = top.len();
     top.sort_by_key(|x| std::cmp::Reverse(x.1));
