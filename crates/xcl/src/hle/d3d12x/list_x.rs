@@ -1830,26 +1830,7 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
                         }
                         return GpuWaitOutcome::Handled;
                     }
-                    if w.is_satisfied() {
-                        return GpuWaitOutcome::Handled;
-                    }
-                    // Without the switch: trusted too if a later value is recorded here (a counter,
-                    // not a flag the title resets and writes again): the producer's lists are done
-                    // on the GPU, and memory the GPU has a copy of (shadowed / sparse windows) gets
-                    // their write only with its copy back.
-                    if cell.recorded_max > w.value {
-                        static STALE: AtomicU64 = AtomicU64::new(0);
-                        if once(&STALE, 16) {
-                            crate::xlog_warn!(
-                                "D3D12.X: Wait64BitValueX at {:#x} >= {:#x}: its producer is done on the GPU (fence {completed:#x}) but memory holds {:x?} – met by the fence",
-                                w.va,
-                                w.value,
-                                w.read_value()
-                            );
-                        }
-                        return GpuWaitOutcome::Handled;
-                    }
-                    return GpuWaitOutcome::FallbackCpu;
+                    return if w.is_satisfied() { GpuWaitOutcome::Handled } else { GpuWaitOutcome::FallbackCpu };
                 }
                 if cell.submitted_max >= w.value && cell.submitted_queue == Some(q_raw) {
                     return GpuWaitOutcome::Handled;
@@ -1903,28 +1884,6 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
     GpuWaitOutcome::Handled
 }
 
-/// `w.wait_until_satisfied(timeout)` that hands the wait to the GPU as soon as `try_gpu_wait`
-/// can: its producer, not recorded yet when the wait began (what made it a CPU wait), recorded
-/// meanwhile on another thread. Waiting on here held this thread's submission for the whole
-/// timeout whenever that producer's queue waits in turn for work this thread submits next.
-/// True: met, or bridged to the GPU.
-unsafe fn wait_or_bridge(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64, u64)], timeout: Duration) -> bool {
-    const SLICE: Duration = Duration::from_millis(20);
-    let start = Instant::now();
-    loop {
-        let left = timeout.saturating_sub(start.elapsed());
-        if w.wait_until_satisfied(left.min(SLICE)) {
-            return true;
-        }
-        if left <= SLICE {
-            return false;
-        }
-        if !queue.is_null() && try_gpu_wait(queue, w, list_writes) != GpuWaitOutcome::FallbackCpu {
-            return true;
-        }
-    }
-}
-
 unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)]) {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
     static RING_DUMPED: AtomicU64 = AtomicU64::new(0);
@@ -1938,7 +1897,7 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
             GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
             GpuWaitOutcome::FallbackCpu => {}
         }
-        if !wait_or_bridge(queue, w, list_writes, timeout) && once(&TIMEOUTS, 40) {
+        if !w.wait_until_satisfied(timeout) && once(&TIMEOUTS, 40) {
             let cell_diag = {
                 let g = SYNC_GRAPH.lock().unwrap();
                 g.as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| (c.recorded_max, c.submitted_max, c.non_monotonic, c.recorded_list_type.map(|t| t.0)))
