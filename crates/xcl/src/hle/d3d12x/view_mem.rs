@@ -199,14 +199,32 @@ unsafe fn evict_stale(s: &mut State, now: std::time::Instant) {
     }
     s.evicted_at = Some(now);
     let old: Vec<usize> = s.tiles.iter().filter(|(_, t)| t.slot.0 != u32::MAX && now.duration_since(t.checked) >= STALE).map(|(&a, _)| a).collect();
+    // window -> its tiles that go (one UpdateTileMappings per window)
+    let mut by_window: HashMap<usize, Vec<u32>> = HashMap::new();
     for &tile in &old {
         let Some(t) = s.tiles.remove(&tile) else { continue };
         let k = (tile - s.base) / WINDOW - FIRST;
-        let coord = D3D12_TILED_RESOURCE_COORDINATE { X: ((tile - s.base) % WINDOW / TILE) as u32, ..Default::default() };
-        let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
-        let (flag, count) = (D3D12_TILE_RANGE_FLAG_NULL, 1u32);
-        s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), None, 1, Some(&flag), None, Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+        by_window.entry(k).or_default().push(((tile - s.base) % WINDOW / TILE) as u32);
         s.free.push(t.slot);
+    }
+    for (k, mut xs) in by_window {
+        xs.sort_unstable();
+        let mut coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = Vec::new();
+        let mut regions: Vec<D3D12_TILE_REGION_SIZE> = Vec::new();
+        let mut counts: Vec<u32> = Vec::new();
+        let mut i = 0;
+        while i < xs.len() {
+            let mut run = 1u32;
+            while i + (run as usize) < xs.len() && xs[i + run as usize] == xs[i] + run {
+                run += 1;
+            }
+            coords.push(D3D12_TILED_RESOURCE_COORDINATE { X: xs[i], ..Default::default() });
+            regions.push(D3D12_TILE_REGION_SIZE { NumTiles: run, UseBox: false.into(), ..Default::default() });
+            counts.push(run);
+            i += run as usize;
+        }
+        let flags = vec![D3D12_TILE_RANGE_FLAG_NULL; coords.len()];
+        s.queue.UpdateTileMappings(&s.windows[k], coords.len() as u32, Some(coords.as_ptr()), Some(regions.as_ptr()), None, flags.len() as u32, Some(flags.as_ptr()), None, Some(counts.as_ptr()), D3D12_TILE_MAPPING_FLAG_NONE);
     }
     s.recent.clear();
     EVICTED.fetch_add(old.len() as u64, Ordering::Relaxed);
@@ -220,6 +238,7 @@ unsafe fn evict_stale(s: &mut State, now: std::time::Instant) {
 /// Shaders may read `[va, va + len)`: the tiles there hold the title's bytes when this returns.
 pub unsafe fn ensure(va: usize, len: usize) {
     let mut g = STATE.lock().unwrap();
+    super::real::removed_probe("view_mem::ensure: start");
     let Some(s) = g.as_mut() else { return };
     let (lo, hi) = (s.base + FIRST * WINDOW, s.base + END * WINDOW);
     if va < lo || va >= hi || len == 0 {
@@ -287,7 +306,13 @@ pub unsafe fn ensure(va: usize, len: usize) {
     if todo.is_empty() {
         return;
     }
-    // new tiles: a pool tile each, mapped under the window
+    // new tiles: a pool tile each, mapped under the window - one UpdateTileMappings per window
+    // and pool heap for all the tiles of this call (lab: it was one call per tile, 100-400 a
+    // second in the world; `XCL_VIEW_MAP_EACH=1`: as before)
+    static EACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let each = *EACH.get_or_init(|| std::env::var("XCL_VIEW_MAP_EACH").is_ok_and(|v| v.trim() == "1"));
+    // (window, pool heap) -> (tile of the window, tile of the heap)
+    let mut maps: HashMap<(usize, u32), Vec<(u32, u32)>> = HashMap::new();
     for &(tile, _, new) in &todo {
         if !new {
             continue;
@@ -297,7 +322,11 @@ pub unsafe fn ensure(va: usize, len: usize) {
             let coord = D3D12_TILED_RESOURCE_COORDINATE { X: ((tile - s.base) % WINDOW / TILE) as u32, ..Default::default() };
             let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
             let (flag, offset, count) = (D3D12_TILE_RANGE_FLAG_NONE, slot.1, 1u32);
-            s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), &s.pools[slot.0 as usize], 1, Some(&flag), Some(&offset), Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+            if each {
+                s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), &s.pools[slot.0 as usize], 1, Some(&flag), Some(&offset), Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+            } else {
+                maps.entry((k, slot.0)).or_default().push((coord.X, slot.1));
+            }
             if let Some(t) = s.tiles.get_mut(&tile) {
                 t.slot = slot;
             }
@@ -325,12 +354,40 @@ pub unsafe fn ensure(va: usize, len: usize) {
         let coord = D3D12_TILED_RESOURCE_COORDINATE { X: ((tile - s.base) % WINDOW / TILE) as u32, ..Default::default() };
         let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
         let (flag, offset, count) = (D3D12_TILE_RANGE_FLAG_NONE, s.next, 1u32);
-        s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), s.pools.last().unwrap(), 1, Some(&flag), Some(&offset), Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+        if each {
+            s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), s.pools.last().unwrap(), 1, Some(&flag), Some(&offset), Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+        } else {
+            maps.entry((k, s.pools.len() as u32 - 1)).or_default().push((coord.X, s.next));
+        }
         if let Some(t) = s.tiles.get_mut(&tile) {
             t.slot = (s.pools.len() as u32 - 1, s.next);
         }
         s.next += 1;
     }
+    for ((k, heap), mut pairs) in maps {
+        // runs of tiles that follow each other in the window and in the heap are one region
+        pairs.sort_unstable();
+        let mut coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = Vec::new();
+        let mut regions: Vec<D3D12_TILE_REGION_SIZE> = Vec::new();
+        let mut offsets: Vec<u32> = Vec::new();
+        let mut counts: Vec<u32> = Vec::new();
+        let mut i = 0;
+        while i < pairs.len() {
+            let (x0, t0) = pairs[i];
+            let mut run = 1u32;
+            while i + (run as usize) < pairs.len() && pairs[i + run as usize] == (x0 + run, t0 + run) {
+                run += 1;
+            }
+            coords.push(D3D12_TILED_RESOURCE_COORDINATE { X: x0, ..Default::default() });
+            regions.push(D3D12_TILE_REGION_SIZE { NumTiles: run, UseBox: false.into(), ..Default::default() });
+            offsets.push(t0);
+            counts.push(run);
+            i += run as usize;
+        }
+        let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; coords.len()];
+        s.queue.UpdateTileMappings(&s.windows[k], coords.len() as u32, Some(coords.as_ptr()), Some(regions.as_ptr()), &s.pools[heap as usize], flags.len() as u32, Some(flags.as_ptr()), Some(offsets.as_ptr()), Some(counts.as_ptr()), D3D12_TILE_MAPPING_FLAG_NONE);
+    }
+    super::real::removed_probe("view_mem::ensure: after the tile mappings");
     for batch in todo.chunks(STAGING_TILES) {
         if s.alloc.Reset().is_err() || s.list.Reset(&s.alloc, None).is_err() {
             return;
@@ -348,7 +405,13 @@ pub unsafe fn ensure(va: usize, len: usize) {
             return;
         }
         let Ok(cl) = s.list.cast::<ID3D12CommandList>() else { return };
+        let was_removed = s.dev.GetDeviceRemovedReason().is_err();
         s.queue.ExecuteCommandLists(&[Some(cl)]);
+        if !was_removed && s.dev.GetDeviceRemovedReason().is_err() {
+            let first: Vec<String> = batch.iter().take(8).map(|&(tile, src, new)| format!("{tile:#x} (window {}, tile {}, from {src:#x}, new {new}, pool tile {:?})", (tile - s.base) / WINDOW, (tile - s.base) % WINDOW / TILE, s.tiles.get(&tile).map(|t| t.slot))).collect();
+            crate::xlog_error!("lab: view memory: the device is removed right after the upload list of {} tiles ({} new in this call of {} tiles to do, range {va:#x}+{len:#x}); {} tiles in {} pools, next pool tile {}, fence value {}: {}", batch.len(), todo.iter().filter(|t| t.2).count(), todo.len(), s.tiles.len(), s.pools.len(), s.next, s.value, first.join("; "));
+        }
+        super::real::removed_probe("view_mem::ensure: after its ExecuteCommandLists");
         s.value += 1;
         if s.queue.Signal(&s.fence, s.value).is_err() {
             return;

@@ -320,6 +320,9 @@ struct State {
     runs: Option<Vec<(usize, usize)>>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
     scratch_runs: Vec<(usize, usize)>,
+    /// lab: placed buffers without video memory yet (`place_buffer` with `lazy`): (resource,
+    /// first tile, bytes from there); their tiles are mapped at the first use (`use_range`)
+    lazy_bufs: Vec<(usize, usize, usize)>,
 }
 
 impl Drop for State {
@@ -723,6 +726,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         waited: FxHashMap::default(),
         runs: None,
         scratch_runs: Vec::new(),
+        lazy_bufs: Vec::new(),
     })
 }
 
@@ -931,6 +935,7 @@ impl State {
         if tiles.is_empty() {
             return;
         }
+        super::real::removed_probe("sparse: before map_tiles");
         let mut by_heap: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
         for &(a, (h, t)) in tiles {
             by_heap.entry(h).or_default().push((((a - res_base) / TILE) as u32, t));
@@ -974,12 +979,14 @@ impl State {
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
         }
+        super::real::removed_probe("sparse: after map_tiles");
     }
 
     unsafe fn unmap_tiles(&self, res: &ID3D12Resource, res_base: usize, tiles: &[usize]) {
         if tiles.is_empty() {
             return;
         }
+        super::real::removed_probe("sparse: before unmap_tiles");
         let mut xs: Vec<u32> = tiles.iter().map(|&a| ((a - res_base) / TILE) as u32).collect();
         xs.sort_unstable();
         let mut coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = Vec::with_capacity(xs.len());
@@ -2067,6 +2074,12 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// time, each as large as the upload ring has room for: scanned and uploaded in one hold of the
 /// lock, the room waited for with it released.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
+    super::real::removed_probe("sparse::before_execute: start");
+    before_execute_inner(queue, dirty, page);
+    super::real::removed_probe("sparse::before_execute: end");
+}
+
+unsafe fn before_execute_inner(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
@@ -2190,6 +2203,74 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
+    place_buffer_when(this, va, desc, state, riid, ppv, false)
+}
+
+/// lab: (start, end) around the addresses of the buffers of `place_buffer_when(.., lazy)` that
+/// have no video memory yet (0, 0: none) - what `use_range` looks at before it takes the lock
+static LAZY_BUFS: [std::sync::atomic::AtomicUsize; 2] = [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+/// lab: bytes of lazily placed buffers: placed, given video memory
+static LAZY_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+fn lazy_bounds(s: &State) {
+    let lo = s.lazy_bufs.iter().map(|b| b.1).min().unwrap_or(0);
+    let hi = s.lazy_bufs.iter().map(|b| b.1 + b.2).max().unwrap_or(0);
+    LAZY_BUFS[0].store(lo, Ordering::Release);
+    LAZY_BUFS[1].store(hi, Ordering::Release);
+}
+
+/// lab: (MB placed lazily, MB of them with video memory)
+pub fn lazy_buffer_mb() -> (u64, u64) {
+    (LAZY_BYTES[0].load(Ordering::Relaxed) >> 20, LAZY_BYTES[1].load(Ordering::Relaxed) >> 20)
+}
+
+/// lab: `[va, va + len)` of the sparse windows is about to be used by the GPU (a V# of a bound
+/// table, a root address, a copy): the lazily placed buffers there get their video memory now.
+/// Called while the list that uses them is recorded; the title's queue waits for the mapping at
+/// its next submit (`before_execute`).
+pub unsafe fn use_range(va: usize, len: usize) {
+    let (lo, hi) = (LAZY_BUFS[0].load(Ordering::Acquire), LAZY_BUFS[1].load(Ordering::Acquire));
+    if va >= hi || va.saturating_add(len.max(1)) <= lo {
+        return;
+    }
+    let mut g = lock_state();
+    let Some(s) = g.as_mut() else { return };
+    let end = va.saturating_add(len.max(1));
+    let mut i = 0;
+    let mut any = false;
+    while i < s.lazy_bufs.len() {
+        let (raw, start, bytes) = s.lazy_bufs[i];
+        if va >= start + bytes || end <= start {
+            i += 1;
+            continue;
+        }
+        s.lazy_bufs.swap_remove(i);
+        any = true;
+        let ptr = raw as *mut c_void;
+        let Some(res) = ID3D12Resource::from_raw_borrowed(&ptr).cloned() else { continue };
+        s.ensure_mapped(start, bytes, |t| query_tile_holes(t));
+        let tiles: Vec<(usize, (u32, u32))> = (start..start + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| (t, e.pool))).collect();
+        s.map_tiles(&res, start, &tiles);
+        for &(_, tile) in &tiles {
+            *s.pinned.entry(tile).or_default() += 1;
+        }
+        s.buffers.insert(raw, tiles);
+        let total = LAZY_BYTES[1].fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+        static N: AtomicU64 = AtomicU64::new(0);
+        let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if k <= 200 || k.is_power_of_two() {
+            crate::xlog_info!("lab: lazy buffer #{k} {raw:#x} at {start:#x} ({bytes} bytes) gets video memory at its first use ({va:#x}); {} MB of {} MB placed so far, {:.1} s", total >> 20, LAZY_BYTES[0].load(Ordering::Relaxed) >> 20, crate::log::uptime());
+        }
+    }
+    if any {
+        lazy_bounds(s);
+        s.signal();
+    }
+}
+
+/// `place_buffer`; lab: with `lazy` the buffer's tiles get no video memory until `use_range`
+/// names an address of it (unmapped tiles read 0 and drop writes).
+pub unsafe fn place_buffer_when(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void, lazy: bool) -> Option<(crate::util::HRESULT, usize)> {
     let mut g = lock_state();
     let s = g.as_mut()?;
     let start = va & !(TILE - 1);
@@ -2212,6 +2293,14 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     let hr = super::real::dev_create_reserved_resource(this, &d as *const _ as usize, state as usize, 0, riid, ppv);
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         return None;
+    }
+    if lazy {
+        let raw = *ppv;
+        s.lazy_bufs.push((raw as usize, start, delta + bytes));
+        s.buffers.insert(raw as usize, Vec::new());
+        LAZY_BYTES[0].fetch_add((delta + bytes) as u64, Ordering::Relaxed);
+        lazy_bounds(s);
+        return Some((hr, delta));
     }
     // its tiles: the window's video memory at the same addresses; probe actual OS commitment
     // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes
@@ -2262,6 +2351,11 @@ pub fn forget_buffer(res: usize) {
 }
 
 fn forget_in(s: &mut State, res: usize) {
+    if let Some(i) = s.lazy_bufs.iter().position(|b| b.0 == res) {
+        let b = s.lazy_bufs.swap_remove(i);
+        LAZY_BYTES[0].fetch_sub(b.2 as u64, Ordering::Relaxed);
+        lazy_bounds(s);
+    }
     let Some(tiles) = s.buffers.remove(&res) else { return };
     for (t, tile) in tiles {
         if let Some(c) = s.pinned.get_mut(&tile) {
@@ -2382,6 +2476,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                lazy_bufs: Vec::new(),
             };
             s.commit_range(base, TILE);
             assert!(s.mapped.contains_key(&base));
@@ -2562,6 +2657,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                lazy_bufs: Vec::new(),
             };
 
             let (first, reused) = s.take_tile().expect("a tile from a new pool");
@@ -2774,6 +2870,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                lazy_bufs: Vec::new(),
             };
 
             // Mirrors `place_buffer`: map both tiles probing real OS page commitment.
@@ -2878,6 +2975,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                lazy_bufs: Vec::new(),
             };
 
             s.commit_range(base, TILE);

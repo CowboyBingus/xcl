@@ -669,6 +669,8 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
+    super::real::use_buffer(args);
+    super::real::use_buffer(count_buf);
     let raw_pso = with(this, |s| s.pso);
     let pso = pso_for_draw(raw_pso);
     let (console_args_off, console_count_off) = (args_off, count_off);
@@ -2332,10 +2334,27 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
             if va >> 32 >= 0x14 {
                 if let Some(q) = super::real::outside_buffer_address(va) {
                     args[at..at + 8].copy_from_slice(&(q as u64).to_le_bytes());
+                    super::sparse::use_range(q, 1);
                     static N: AtomicU64 = AtomicU64::new(0);
                     let k = N.fetch_add(1, Ordering::Relaxed) + 1;
                     if k <= 8 || k.is_power_of_two() {
                         crate::xlog_info!("lab: root address #{k} {va:#x} in an outside buffer -> {q:#x}");
+                    }
+                }
+            }
+        }
+    }
+    // lab: lazily placed buffers the tables name get their video memory (`sparse::use_range`)
+    if super::sparse::lazy_buffer_mb().0 != 0 {
+        if let Some(l) = layout.as_deref() {
+            for table in table_addresses(l, &args, u.base()) {
+                if !crate::gpu::shader::readable(table, 32 * 64) {
+                    continue;
+                }
+                for k in 0..64 {
+                    let d = ((table + 32 * k) as *const [u32; 4]).read_unaligned();
+                    if d[3] >> 30 == 0 && (d[0] | d[1]) != 0 {
+                        super::sparse::use_range(((d[1] as usize & 0xFFFF) << 32) | d[0] as usize, 1);
                     }
                 }
             }

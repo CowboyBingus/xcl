@@ -212,6 +212,7 @@ pub unsafe fn forget(alloc: usize) {
 /// submits the GPU has passed – not for one put aside because the GPU still runs what was
 /// recorded on it (#1358).
 pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
+    super::real::removed_probe("alloc_pool::title_reset: start");
     title_reset_with(alloc, |raw| super::real::reset_pc_allocator(raw))
 }
 

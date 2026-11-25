@@ -62,6 +62,7 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
 }
 
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
+    super::real::removed_probe("present: start");
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     super::targets::frame_end();
     if frames % 300 == 0 {

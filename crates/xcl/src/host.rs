@@ -184,6 +184,22 @@ pub fn host_main(boot_path: &Path) -> i32 {
                         classes[c].0 += r;
                         classes[c].1 += 1;
                     }
+                    // lab: the mapped views of 256 MB or more (some other component's: XCL maps
+                    // none): where, how much is committed, and the file behind them if any;
+                    // `XCL_TRIM_VIEWS=1`: their pages are taken out of the working set
+                    // (VirtualUnlock on pages that are not locked does that)
+                    for (&b, &(_, c, span, t)) in by_base.iter() {
+                        if t != MEM_MAPPED || span < 256 << 20 {
+                            continue;
+                        }
+                        let mut name = [0u16; 260];
+                        let n = unsafe { windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW(windows_sys::Win32::System::Threading::GetCurrentProcess(), b as *const _, name.as_mut_ptr(), 260) } as usize;
+                        let trimmed = std::env::var("XCL_TRIM_VIEWS").is_ok_and(|v| v.trim() == "1") && {
+                            unsafe { windows_sys::Win32::System::Memory::VirtualUnlock(b as *const _, span as usize) };
+                            true
+                        };
+                        crate::xlog_info!("memory lab: mapped view at {b:#x}: {} of {} MB committed, file {:?}{}", mb(c), mb(span), String::from_utf16_lossy(&name[..n.min(260)]), if trimmed { ", taken out of the working set" } else { "" });
+                    }
                     let mut v: Vec<(usize, (u64, u64, u64, u32))> = by_base.into_iter().collect();
                     v.sort_unstable_by_key(|&(_, (r, ..))| std::cmp::Reverse(r));
                     let top: Vec<String> = v.iter().take(16).map(|&(b, (r, c, span, t))| format!("{b:#x} {} of {} MB committed (span {} MB, {})", mb(r), mb(c), mb(span), if t == MEM_IMAGE { "image" } else if t == MEM_MAPPED { "mapped" } else { "private" })).collect();

@@ -1454,7 +1454,11 @@ pub(super) unsafe fn place_outside_buffer(this: *mut c_void, va: usize, desc: &[
     // an address in the sparse windows without CPU pages (the title never maps these; committed
     // pages cost RAM: w57 was RAM-killed at 100 s with them): its tiles get video memory only
     let (p, _) = u.sparse_alloc(bytes, 0x1_0000)?;
-    let Some((hr, delta)) = super::sparse::place_buffer(this, p, &d, state & PC_RESOURCE_STATES, riid, ppv) else {
+    // `XCL_OUTSIDE_LAZY=0`: video memory for all of it at once (w59-w61: +1.3 GB before the world);
+    // else at the buffer's first use (`sparse::use_range`)
+    static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let lazy = *LAZY.get_or_init(|| !std::env::var("XCL_OUTSIDE_LAZY").is_ok_and(|v| v.trim() == "0"));
+    let Some((hr, delta)) = super::sparse::place_buffer_when(this, p, &d, state & PC_RESOURCE_STATES, riid, ppv, lazy) else {
         u.sparse_release(p);
         return None;
     };
@@ -1481,6 +1485,17 @@ pub(super) unsafe fn place_outside_buffer(this: *mut c_void, va: usize, desc: &[
         }
     }
     Some(hr)
+}
+
+/// lab: resource `res` is used by a call of the title (a copy, indirect arguments): a lazily
+/// placed buffer gets its video memory.
+pub unsafe fn use_buffer(res: usize) {
+    if super::sparse::lazy_buffer_mb().0 == 0 {
+        return;
+    }
+    if let Some((p, n)) = console_buffer(res) {
+        super::sparse::use_range(p, n);
+    }
 }
 
 /// lab: the address in the windows of title address `va` when it is in a buffer of `place_outside_buffer`.
@@ -7056,22 +7071,31 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
             mapped.push(l);
         }
     }
+    removed_probe("execute: start");
     // page budget: evicted textures these lists transition are mapped again, uploaded below
     super::title_textures::revive_listed(&mapped);
+    removed_probe("execute: after revive_listed");
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
+    removed_probe("execute: after refresh");
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
+        removed_probe("execute: before the PC call");
         f(this, chunk.len() as u32, chunk.as_ptr());
+        removed_probe("execute: after the PC call");
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
+        removed_probe("execute: after alloc_pool::executed");
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
+        removed_probe("execute: after readback_sparse_writes");
         super::list_x::cpu_writes_after(this, chunk);
+        removed_probe("execute: after cpu_writes_after");
     });
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
     super::present::note_execute(this, &mapped);
+    removed_probe("execute: end");
     stop_if_device_removed();
 }
 
@@ -7207,6 +7231,26 @@ pub fn log_device_removed() {
                 let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
                 crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()), node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
             });
+        }
+    }
+}
+
+/// lab: where a device removal is first seen (`XCL_REMOVED_PROBE=1`): each site says once, with
+/// the time, that the device is removed when it asks - sites are before and after the calls
+/// that could cause it, so the first "after" without its "before" names the call.
+pub fn removed_probe(site: &'static str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_REMOVED_PROBE").is_ok_and(|v| v.trim() == "1")) {
+        return;
+    }
+    let raw = device_raw();
+    let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
+    if let Err(e) = unsafe { dev.GetDeviceRemovedReason() } {
+        static SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        let mut g = SEEN.lock().unwrap();
+        if !g.contains(&site) {
+            g.push(site);
+            crate::xlog_error!("lab: removed probe #{}: the device is removed ({:#x}) at '{site}'", g.len(), e.code().0 as u32);
         }
     }
 }

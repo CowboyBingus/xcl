@@ -546,6 +546,7 @@ impl Pages {
         if tiles.is_empty() {
             return;
         }
+        super::real::removed_probe("vram: before map");
         self.scratch_heaps.clear();
         self.scratch_heaps.extend(tiles.iter().map(|t| t.0));
         self.scratch_heaps.sort_unstable();
@@ -583,6 +584,7 @@ impl Pages {
         }
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+        super::real::removed_probe("vram: after map");
     }
 
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
@@ -591,6 +593,7 @@ impl Pages {
         if total == 0 {
             return;
         }
+        super::real::removed_probe("vram: before unmap");
         let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
         let flag = D3D12_TILE_RANGE_FLAG_NULL;
