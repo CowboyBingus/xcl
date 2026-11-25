@@ -482,17 +482,24 @@ unsafe extern "system" fn factory_unknown(_p: *mut c_void) -> HRESULT {
     E_NOTIMPL
 }
 
+/// `DSTORAGE_QUEUE_OPTIONS` bit 0: the queue does not submit by itself when half full.
+const AUTO_SUBMIT_DISABLED: u64 = 1;
+
 /// Slot 10 of the newer factory: CreateQueue with a 0x20-byte desc – the 0x18 of
-/// `factory_create_queue`, then a u64 (a retail game: 1).
-unsafe extern "system" fn factory_create_queue1(p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+/// `factory_create_queue`, then the u64 `DSTORAGE_QUEUE_OPTIONS` (a retail game: 1,
+/// `AutoSubmitDisabled`: it writes a request's destination page list after `EnqueueRequest`
+/// and before its own `Submit`). `XCL_DSTORAGE_AUTO_SUBMIT=1` keeps the half-full submit anyway.
+unsafe extern "system" fn factory_create_queue1(_p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    let mut options = 0;
     if !desc.is_null() {
-        let extra = (desc.add(0x18) as *const u64).read_unaligned();
+        options = (desc.add(0x18) as *const u64).read_unaligned();
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            crate::xlog_info!("DirectStorage: CreateQueue (0x20 desc), u64 @0x18 = {extra:#x}");
+            crate::xlog_info!("DirectStorage: CreateQueue (0x20 desc), options {options:#x}");
         }
     }
-    factory_create_queue(p, desc, riid, out)
+    let forced = std::env::var("XCL_DSTORAGE_AUTO_SUBMIT").is_ok_and(|v| v == "1");
+    create_queue(desc, riid, out, forced || options & AUTO_SUBMIT_DISABLED == 0)
 }
 
 unsafe extern "system" fn factory_set_cpu_affinity(_p: *mut c_void, _mask: u64) -> HRESULT {
@@ -777,6 +784,13 @@ impl Request {
     }
 }
 
+/// `[p, p + len)` overlaps the calling thread's stack.
+fn on_callers_stack(p: usize, len: usize) -> bool {
+    let (mut lo, mut hi) = (0usize, 0usize);
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut lo, &mut hi) };
+    p < hi && p.saturating_add(len.max(1)) > lo
+}
+
 /// Snapshot a `PULONG_PTR` physical page array at enqueue time (callers often stack-allocate it).
 unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Vec<usize>, HRESULT> {
     if byte_len == 0 {
@@ -870,7 +884,7 @@ fn note_request(r: &Request) {
 }
 
 /// Run a request; the destination gets the bytes or nothing.
-unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
+unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, dest_on_stack: bool, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     note_request(r);
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
@@ -927,6 +941,23 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
 
     if r.dest_physical_pages() {
         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+        // The console reads the page list when it runs the request. A retail title keeps its
+        // lists in slots of its own table and writes a slot after EnqueueRequest, so the
+        // snapshot can name the pages of the slot's previous request (written there, the data
+        // goes to pages the title uses for something else). A list that differs now and whose
+        // pages are all allocated is taken (`write_physical_pages` checks every page before it
+        // writes); one on the enqueuing thread's stack keeps the snapshot (that memory is
+        // reused once the call returns).
+        let mut now = vec![0usize; pages.len()];
+        let now_read = !pages.is_empty() && read_own(r.destination as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages));
+        if !dest_on_stack && now_read && now[..] != pages[..] && crate::hle::kernelx::write_physical_pages(&now, r.destination_page_offset as usize, &payload[..n]) {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if k.is_power_of_two() {
+                crate::xlog_info!("DirectStorage: {k} page lists changed after their request was enqueued: the pages named at execution are used");
+            }
+            return Ok(());
+        }
         // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
         // read again now. A retail title keeps its page arrays in its own tables and fills an
         // entry after EnqueueRequest – its streaming requests were refused by the thousand
@@ -940,6 +971,17 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             pages
         };
         if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
+            // lab diagnostics: what the list held at enqueue and holds now
+            static BAD: AtomicU64 = AtomicU64::new(0);
+            let k = BAD.fetch_add(1, Ordering::Relaxed);
+            if k < 40 || (k + 1).is_power_of_two() {
+                crate::xlog_warn!(
+                    "DirectStorage: page list #{k} unresolved at {:#x} (on stack {dest_on_stack}): at enqueue {:x?}, now {}",
+                    r.destination,
+                    &pages[..pages.len().min(8)],
+                    if now_read { format!("{:x?}", &now[..now.len().min(8)]) } else { "unreadable".into() }
+                );
+            }
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
@@ -980,6 +1022,8 @@ enum Entry {
         req: Request,
         file: Option<Arc<FileInner>>,
         dest_pages: Option<Vec<usize>>,
+        /// the destination page list was on the enqueuing thread's stack (`on_callers_stack`)
+        dest_on_stack: bool,
         src_pages: Option<Vec<usize>>,
     },
     /// refused at enqueue: reported in queue order by the worker (unless cancelled, as a request)
@@ -1021,6 +1065,8 @@ struct QueueInner {
     desc: [u8; 0x18],
     source_memory: bool,
     capacity: usize,
+    /// submits by itself when half full (not when made with `AutoSubmitDisabled`)
+    auto_submit: bool,
     pending: Mutex<Pending>,
     cancels: Mutex<Vec<CancelRule>>,
     worker: Mutex<Option<mpsc::Sender<Vec<Entry>>>>,
@@ -1139,12 +1185,12 @@ impl QueueInner {
             return;
         }
         match e {
-            Entry::Request { seq, req, file, dest_pages, src_pages } => {
+            Entry::Request { seq, req, file, dest_pages, dest_on_stack, src_pages } => {
                 if self.is_cancelled(seq, req.tag) {
                     // Cancelled requests are skipped without affecting status or error record.
                     return;
                 }
-                if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
+                if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), dest_on_stack, src_pages.as_deref()) } {
                     self.update_error(hr, req, file.as_deref(), since_status);
                 }
             }
@@ -1190,13 +1236,23 @@ impl QueueInner {
             p.entries.len()
         };
         // as on PC: a half-full queue submits by itself
-        if n >= (self.capacity / 2).max(1) {
+        if n >= self.submit_at() {
             self.submit();
         }
     }
 
-    fn enqueue_request(self: &Arc<Self>, req: Request, file: Option<Arc<FileInner>>, dest_pages: Option<Vec<usize>>, src_pages: Option<Vec<usize>>) {
-        self.enqueue_numbered(|seq| Entry::Request { seq, req, file, dest_pages, src_pages });
+    /// Entries at which the queue submits by itself: half its capacity, or with
+    /// `AutoSubmitDisabled` its whole capacity (where the console would hold the title's
+    /// enqueue until its Submit; XCL does not, so a title that never submits cannot hang).
+    fn submit_at(&self) -> usize {
+        if self.auto_submit {
+            return (self.capacity / 2).max(1);
+        }
+        self.capacity.max(1)
+    }
+
+    fn enqueue_request(self: &Arc<Self>, req: Request, file: Option<Arc<FileInner>>, dest_pages: Option<Vec<usize>>, dest_on_stack: bool, src_pages: Option<Vec<usize>>) {
+        self.enqueue_numbered(|seq| Entry::Request { seq, req, file, dest_pages, dest_on_stack, src_pages });
     }
 
     /// A request refused at enqueue, numbered as a request so `CancelRequestsWithTag` covers it.
@@ -1215,7 +1271,14 @@ impl QueueInner {
             p.entries.push(entry(seq));
             p.entries.len()
         };
-        if n >= (self.capacity / 2).max(1) {
+        if n >= self.submit_at() {
+            if !self.auto_submit {
+                static FULL: AtomicU64 = AtomicU64::new(0);
+                let k = FULL.fetch_add(1, Ordering::Relaxed) + 1;
+                if k.is_power_of_two() {
+                    crate::xlog_info!("DirectStorage: {k} submits of a full AutoSubmitDisabled queue before the title's Submit");
+                }
+            }
             self.submit();
         }
     }
@@ -1252,6 +1315,10 @@ fn queue_vtbl() -> &'static [usize] {
 }
 
 unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    create_queue(desc, riid, out, true)
+}
+
+unsafe fn create_queue(desc: *const u8, riid: *const GUID, out: *mut *mut c_void, auto_submit: bool) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
@@ -1280,6 +1347,7 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         desc: raw,
         source_memory: source == 1,
         capacity,
+        auto_submit,
         pending: Mutex::new(Pending { entries: Vec::new(), next_seq: 1 }),
         cancels: Mutex::new(Vec::new()),
         worker: Mutex::new(None),
@@ -1379,7 +1447,8 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
     } else {
         None
     };
-    q.enqueue_request(r, file, dest_pages, src_pages);
+    let dest_on_stack = dest_pages.as_ref().is_some_and(|p| on_callers_stack(r.destination as usize, std::mem::size_of_val(&p[..])));
+    q.enqueue_request(r, file, dest_pages, dest_on_stack, src_pages);
 }
 
 unsafe extern "system" fn queue_enqueue_status(p: *mut c_void, array: *mut c_void, index: u32) {
@@ -1526,7 +1595,7 @@ unsafe extern "system" fn queue_query(p: *mut c_void, out: *mut u8) {
     let q = queue(p);
     let pending = q.pending.lock().unwrap().entries.len();
     let empty = q.capacity.saturating_sub(pending) as u16;
-    let until = (q.capacity / 2).max(1).saturating_sub(pending).max(1) as u16;
+    let until = q.submit_at().saturating_sub(pending).max(1) as u16;
     let mut info = [0u8; 0x1C];
     info[..0x18].copy_from_slice(&q.desc);
     info[0x18..0x1A].copy_from_slice(&empty.to_le_bytes());
@@ -2236,6 +2305,132 @@ mod tests {
             assert_eq!((hresult(s, 0), hresult(s, 1)), (S_OK, E_ACCESS_VIOLATION));
             let got = std::slice::from_raw_parts((reserved as *const u8).add(page_off as usize), data.len());
             assert_eq!(got, &data[..], "the bytes cross from the page that was there into the one filled in later");
+
+            MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
+            windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A queue made through CreateQueue1 with `AutoSubmitDisabled` does not submit by itself
+    /// when half full: its requests run at the title's Submit (or when it is full). Without
+    /// the option it submits at half its capacity, as before.
+    #[test]
+    fn a_queue_with_auto_submit_disabled_runs_at_submit() {
+        use std::time::{Duration, Instant};
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY_X1, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue1: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(10));
+            for (options, by_itself) in [(AUTO_SUBMIT_DISABLED, false), (0, true)] {
+                let mut desc = [0u8; 0x20];
+                desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory source
+                desc[8..10].copy_from_slice(&4u16.to_le_bytes()); // capacity 4: half full at 2
+                desc[10] = 2;
+                desc[0x18..0x20].copy_from_slice(&options.to_le_bytes());
+                let mut q = std::ptr::null_mut();
+                assert_eq!(create_queue1(f, desc.as_ptr(), &IID_QUEUE_X1, &mut q), S_OK);
+                let qv = *(q as *const *const usize);
+                let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+                let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+                let src = [0x5Au8; 64];
+                let dst = [vec![0u8; 64], vec![0u8; 64]];
+                for d in &dst {
+                    enqueue(q, request(SOURCE_MEMORY_BIT, d.as_ptr() as u64, 64, src.as_ptr() as u64, 0, 64).as_ptr());
+                }
+                let done = || dst.iter().all(|d| d.iter().all(|b| std::ptr::read_volatile(b) == 0x5A));
+                let t = Instant::now();
+                while !done() && t.elapsed() < Duration::from_millis(300) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(done(), by_itself, "options {options:#x}: half full, before Submit");
+                submit(q);
+                let t = Instant::now();
+                while !done() && t.elapsed() < Duration::from_secs(5) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(done(), "options {options:#x}: after Submit");
+                queue_close(q);
+                queue_release(q);
+            }
+        }
+    }
+
+    /// A title's table slot names its previous request's page at enqueue and this request's
+    /// page before Submit: the data goes to the page named at execution, the old page is left
+    /// alone. A list on the enqueuing thread's stack keeps its snapshot.
+    #[test]
+    fn a_destination_page_list_rewritten_after_enqueue() {
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        unsafe {
+            let mut count = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&16u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+            let reserved = windows_sys::Win32::System::Memory::VirtualAlloc(
+                std::ptr::null(),
+                2 * PHYS_PAGE_SIZE,
+                windows_sys::Win32::System::Memory::MEM_RESERVE,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+            );
+            assert!(!reserved.is_null());
+            assert_eq!(MapTitlePhysicalPages(reserved, 2, 0, 4, pages.as_mut_ptr()), reserved);
+            let page = |k: usize| std::slice::from_raw_parts((reserved as *const u8).add(k * PHYS_PAGE_SIZE), 32);
+
+            // 0. a slot in a heap table: page 0 at enqueue, page 1 before Submit
+            let a = [0xA5u8; 32];
+            let mut table = Box::new([pages[0]]);
+            enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, table.as_ptr() as u64, 0, 32, a.as_ptr() as u64, 0, 32, 0, 0).as_ptr());
+            std::ptr::write_volatile(&mut table[0], pages[1]);
+            status(q, s, 0);
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 0) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(hresult(s, 0), S_OK);
+            assert_eq!(page(1), &a[..], "the page named at execution gets the data");
+            assert_eq!(page(0), &[0u8; 32][..], "the page named at enqueue is left alone");
+
+            // 1. the same on the stack: the snapshot (page 0) is kept
+            let b = [0x3Cu8; 32];
+            let mut on_stack = [pages[0]];
+            enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, on_stack.as_ptr() as u64, 0, 32, b.as_ptr() as u64, 0, 32, 0, 0).as_ptr());
+            std::ptr::write_volatile(&mut on_stack[0], pages[1]);
+            status(q, s, 1);
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 1) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(hresult(s, 1), S_OK);
+            assert_eq!((page(0), page(1)), (&b[..], &a[..]), "a list on the stack keeps its snapshot");
 
             MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
             windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
