@@ -2856,6 +2856,25 @@ pub unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: 
     if ty != D3D12_COMMAND_LIST_TYPE_DIRECT && ty != D3D12_COMMAND_LIST_TYPE_COMPUTE {
         return warn(&N, "SetPredicationBufferX", format_args!("unsupported command list type {}", ty.0));
     }
+    // lab: how often the title predicates, and `XCL_NO_PREDICATION=1`: its predicates are ignored (everything runs)
+    {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        static NULLS: AtomicU64 = AtomicU64::new(0);
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if desc.is_null() {
+            NULLS.fetch_add(1, Ordering::Relaxed);
+        }
+        let off = *OFF.get_or_init(|| std::env::var_os("XCL_NO_PREDICATION").is_some());
+        if n <= 4 || n.is_power_of_two() {
+            let d = if !desc.is_null() && crate::gpu::shader::readable(desc as usize, 12) { Some((desc.read_unaligned(), (desc.add(1) as *const u32).read_unaligned())) } else { None };
+            let mem = d.filter(|&(va, _)| crate::gpu::shader::readable(va as usize, 8)).map(|(va, _)| (va as *const u64).read_unaligned());
+            crate::xlog_info!("D3D12.X: SetPredicationBufferX #{n} ({} with no buffer so far): (address, op) {d:x?}, the CPU's view of the predicate {mem:x?}, list type {}{}", NULLS.load(Ordering::Relaxed), ty.0, if off { " – ignored (XCL_NO_PREDICATION)" } else { "" });
+        }
+        if off {
+            return;
+        }
+    }
     type F = unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP);
     if desc.is_null() {
         let f = pc::<F>(this, PC_SET_PREDICATION);

@@ -313,8 +313,10 @@ pub(super) unsafe fn bound_within(
                 g.push(page);
                 let u = crate::gpu::uma::get();
                 crate::xlog_info!(
-                    "indirect clamp: records of kind {} at {:#x} (buffer {p:#x}, {len} bytes, offset {args_off:#x}), window {:?}, sparse {:?}, source at {source_at:#x}, count buffer {:x?} offset {count_off:#x}, budget {budget}, via args {via_args}",
+                    "indirect clamp: records of kind {} (stride {}, action at {}, max {max}) at {:#x} (buffer {p:#x}, {len} bytes, offset {args_off:#x}), window {:?}, sparse {:?}, source at {source_at:#x}, count buffer {:x?} offset {count_off:#x}, budget {budget}, via args {via_args}",
                     s.kind,
+                    s.stride,
+                    s.action_at,
                     p + args_off as usize,
                     u.and_then(|u| u.window_of(p)),
                     u.map(|u| u.is_sparse(p)),

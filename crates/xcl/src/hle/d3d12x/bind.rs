@@ -720,6 +720,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // the records bounded on the GPU first (a garbage record would hang it): this changes the
     // list's compute bindings, which `bind_abi` sets again
     let bounded = super::indirect_clamp::bound(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off);
+    if let (Some(b), false) = (&bounded, gfx) {
+        // lab: the control for the two-pass notes (kind 7: records, kind, stride of a compute call)
+        ei_peek(this, 7, max, b.raw(), 0x8018, 0, 0);
+    }
     match &bounded {
         Some(b) => ei_peek(this, if gfx { 1 } else { 2 }, max, b.raw(), 0, count_buf, count_off),
         None => ei_peek(this, if gfx { 1 } else { 2 }, max, args, args_off, count_buf, count_off),
