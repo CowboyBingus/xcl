@@ -1849,10 +1849,92 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
     }
 }
 
+/// lab: `XCL_DISPATCH_PROBE=<seconds>` – from then on, once per compute pipeline (up to 800):
+/// its console CS (record hash), groups, and the textures its root arguments can name: every
+/// small value of its constants and root buffers looked up as a slot of its descriptor tables
+/// and of the title's bound view heap (as `trace_fullscreen` does), plus the first 48 slots of
+/// each table. `WxH fN` per texture; the ones the title presents are marked.
+unsafe fn dispatch_probe(this: *mut c_void, pso: usize, groups: [u32; 3]) {
+    static FROM: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    let Some(from) = *FROM.get_or_init(|| std::env::var("XCL_DISPATCH_PROBE").ok().and_then(|v| v.trim().parse().ok())) else { return };
+    if crate::log::uptime() < from {
+        return;
+    }
+    let real = super::pso_async::resolve(pso);
+    static SEEN: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+    {
+        let mut g = SEEN.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.len() >= 800 && !m.contains_key(&real) {
+            return;
+        }
+        let n = m.entry(real).or_insert(0);
+        *n += 1;
+        if *n != 1 && *n != 40 {
+            return;
+        }
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let (layout, args) = with(this, |s| (s.layout.clone(), s.args.clone()));
+    let Some(layout) = layout else { return };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let mut tables: Vec<usize> = Vec::new();
+    let mut values: Vec<u32> = Vec::new();
+    for p in layout.params.iter() {
+        match *p {
+            Param::Constants { at, count } => values.extend((0..count as usize).filter_map(|k| word(at as usize + 4 * k))),
+            Param::Descriptor { at } => {
+                let va = (word(at as usize).unwrap_or(0) as u64 | (word(at as usize + 4).unwrap_or(0) as u64) << 32) as usize;
+                if va != 0 && crate::gpu::shader::readable(va, 4 * 96) {
+                    values.extend((0..96).map(|k| ((va + 4 * k) as *const u32).read_unaligned()));
+                }
+            }
+            Param::Table { at } => {
+                let v = word(at as usize).unwrap_or(0);
+                if v != 0 {
+                    tables.push(u.base() + v as usize);
+                }
+            }
+        }
+    }
+    let heap = super::list_x::title_view_heap(this) as usize;
+    let mut found: Vec<(String, usize)> = Vec::new();
+    let mut add = |tag: String, slot: usize, found: &mut Vec<(String, usize)>| {
+        if let Some(r) = super::console_heap::resource_at(slot) {
+            if !found.iter().any(|x| x.1 == r) {
+                found.push((tag, r));
+            }
+        }
+    };
+    for (ti, &t) in tables.iter().enumerate() {
+        for k in 0..48usize {
+            add(format!("t{ti}[{k}]"), t + 32 * k, &mut found);
+        }
+        for &v in values.iter().filter(|&&v| v < 1 << 20) {
+            add(format!("t{ti}[{v}]"), t + 32 * v as usize, &mut found);
+        }
+    }
+    if heap != 0 {
+        for &v in values.iter().filter(|&&v| v < 1 << 20) {
+            add(format!("h[{v}]"), heap + 32 * v as usize, &mut found);
+        }
+    }
+    let res: Vec<String> = found
+        .iter()
+        .filter_map(|(tag, r)| {
+            let d = ID3D12Resource::from_raw_borrowed(&(*r as *mut c_void)).map(|x| x.GetDesc())?;
+            (d.Dimension.0 >= 2).then(|| format!("{tag} {}x{} f{}{}", d.Width, d.Height, d.Format.0, if super::present::is_presented(*r) { " PRESENTED" } else { "" }))
+        })
+        .collect();
+    let cs = super::real::pso_shaders(real).map_or(0, |s| s.0);
+    crate::xlog_info!("dispatch probe: cs {cs:016x} groups {groups:?} at {:.1} s: {}", crate::log::uptime(), res.join(", "));
+}
+
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }
+    dispatch_probe(this, pso, [x, y, z]);
     bind_abi(this, list, pso, false)?;
     list.Dispatch(x, y, z);
     Ok(())
