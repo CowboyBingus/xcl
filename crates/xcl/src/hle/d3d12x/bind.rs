@@ -408,6 +408,10 @@ unsafe fn bind_two_pass_stage(
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
+    if compute_pass {
+        // lab: what the program reads of the title's memory outside the unified windows
+        super::view_mem::ensure_for_draw(layout.as_deref(), &args);
+    }
     let inline = layout
         .as_ref()
         .map_or(0, |l| if compute_pass { l.inline_ms } else { l.inline_gfx } as usize)

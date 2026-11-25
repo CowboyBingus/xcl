@@ -31,6 +31,7 @@ mod shader_cache_session;
 pub mod sparse;
 mod targets;
 pub mod title_list;
+pub mod view_mem;
 pub mod title_textures;
 pub mod vram;
 

@@ -62,6 +62,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
                     c.PrivateUsage
                 };
+                crate::xlog_info!("{}", crate::hle::d3d12x::view_mem::stats());
                 let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();

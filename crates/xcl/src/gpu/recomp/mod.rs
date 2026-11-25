@@ -73,6 +73,11 @@ mod heap_window_tests;
 /// window k is raw UAV `MEM_HEAP_BASE + k`.
 pub const MEM_HEAP_BASE: u32 = 0;
 
+/// Windows a shader with `Options::heap_windows` reaches (descriptors `MEM_HEAP_BASE`..): the
+/// unified block's (`uma::MAX_WINDOWS`) and, after them, the title's memory outside it
+/// (`d3d12x::view_mem`: a retail title's geometry in its GPU view).
+pub const HEAP_WINDOW_SLOTS: u32 = 16;
+
 /// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;

@@ -159,7 +159,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             heap,
             cap,
             // the memory windows' raw UAVs (`set_window_views`) come first
-            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_WINDOWS as u32,
+            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::recomp::HEAP_WINDOW_SLOTS,
             free: Vec::new(),
         });
     }
@@ -186,7 +186,7 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
             (s.dev.clone(), s.cpu, s.inc)
         };
         // The device may be adopted: its UAV hook re-enters descriptor bookkeeping.
-        for k in 0..crate::gpu::uma::MAX_WINDOWS {
+        for k in 0..crate::gpu::recomp::HEAP_WINDOW_SLOTS as usize {
             let (raw, bytes) = windows.get(k).copied().filter(|w| w.0 != 0).unwrap_or(windows[0]);
             let raw = raw as *mut std::ffi::c_void;
             let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) else { continue };
@@ -615,10 +615,10 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
-                next: crate::gpu::uma::MAX_WINDOWS as u32, free: Vec::new(),
+                next: crate::gpu::recomp::HEAP_WINDOW_SLOTS, free: Vec::new(),
             });
             assert!(set_window_views(&dev, &[(&mut resource as *mut _ as usize, 0x10000)]));
-            assert_eq!(CALLS.load(Ordering::Relaxed), crate::gpu::uma::MAX_WINDOWS as u32);
+            assert_eq!(CALLS.load(Ordering::Relaxed), crate::gpu::recomp::HEAP_WINDOW_SLOTS);
             assert!(UNLOCKED.load(Ordering::Relaxed), "device callback ran while GLOBAL was locked");
             *GLOBAL.lock().unwrap() = None;
         }

@@ -421,7 +421,10 @@ unsafe fn open_uma(device: &ID3D12Device) {
     }
     // shaders take the windows from the shared descriptor heap (`pso::heap_windows`)
     if n > 1 && crate::gpu::recomp::pso::heap_windows() {
-        let views: Vec<(usize, usize)> = bufs.iter().enumerate().map(|(k, b)| (b.0, u.window(k).1)).collect();
+        let mut views: Vec<(usize, usize)> = bufs.iter().enumerate().map(|(k, b)| (b.0, u.window(k).1)).collect();
+        // lab: the title's memory outside the unified block (windows 4..)
+        views.resize(super::view_mem::FIRST, (0, 0));
+        views.extend(super::view_mem::init(device, u.base()));
         if super::console_heap::set_window_views(device, &views) {
             crate::xlog_info!("D3D12.X: memory windows from the shared descriptor heap (no per-access switch)");
         }
