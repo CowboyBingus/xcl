@@ -1973,11 +1973,11 @@ impl Lw {
     // ------------------------------------------------------------ LDS / DS
 
     /// LDS dword index of byte address `at` (`(at >> 2) & 8191`, below the exchange words
-    /// in the split form).
+    /// in the split form and the safe barrier's words).
     fn lds_index(&mut self, at: Value) -> Value {
         let i = self.lshrc(at, 2);
         let i = self.andc(i, 8191);
-        if self.split {
+        if self.lds_top < 8191 {
             let k = self.c(self.lds_top);
             self.umin(i, k)
         } else {
