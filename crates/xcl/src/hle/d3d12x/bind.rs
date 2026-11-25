@@ -579,10 +579,18 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
     let pso = pso_for_draw(raw_pso);
+    let (console_args_off, console_count_off) = (args_off, count_off);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if let Some(tp) = super::real::two_pass_of(pso) {
         if let Some(msig) = dispatch_mesh_sig_of(sig) {
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+            // the records bounded on the GPU first, as for other ExecuteIndirect calls below: a
+            // garbage record hung the GPU here (0x887a0006). Both passes read the bounded copy.
+            let bounded = super::indirect_clamp::bound(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off);
+            let (args, args_off) = match &bounded {
+                Some(b) => (b.raw(), 0),
+                None => (args, args_off),
+            };
             let run = (|| -> Result<(), String> {
                 let (res_buf, res_va) = ensure_res_buffer(this, 32 << 20)?;
                 bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
@@ -599,6 +607,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 emit_uav_barrier(list, Some(&res_buf));
                 Ok(())
             })();
+            if let Some(b) = bounded {
+                b.finish(list);
+            }
             match run {
                 Ok(()) => {
                     count(DRAWS);
@@ -661,17 +672,25 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-    match bind_abi(this, list, pso, gfx) {
-        Ok(()) => {
-            count(if gfx { DRAWS } else { DISPATCHES });
-            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
-        }
-        Err(e) => {
-            count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
-            }
+    // the records bounded on the GPU first (a garbage record would hang it): this changes the
+    // list's compute bindings, which `bind_abi` sets again
+    let bounded = super::indirect_clamp::bound(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off);
+    let result = bind_abi(this, list, pso, gfx);
+    if let Ok(()) = result {
+        count(if gfx { DRAWS } else { DISPATCHES });
+        fresh_indirect_arguments(this, || match &bounded {
+            Some(b) => pc(this, sig, max, b.raw(), 0, count_buf, count_off),
+            None => pc(this, sig, max, args, args_off, count_buf, count_off),
+        });
+    }
+    if let Some(b) = bounded {
+        b.finish(list);
+    }
+    if let Err(e) = result {
+        count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
         }
     }
 }
