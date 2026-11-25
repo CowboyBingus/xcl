@@ -756,7 +756,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             let d = res.GetDesc();
             // lab (`XCL_POST_PROBE`): kind `s` = sampled by the tone-map draw: whatever its size.
             // A 3-D texture (the colour LUTs): its first slice. A 1x1 / 2x2 target (the exposure) always.
-            let shape = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            let shape = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || (kind == b's' && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D);
             let small = d.Width < 128 && d.Width * d.Height as u64 > 4 && kind != b's';
             if !shape || d.SampleDesc.Count > 1 || small || taken >= 80 {
                 crate::xlog_info!("rt dump: {k} {} not copied: dimension {} {}x{} format {} samples {}", kind as char, d.Dimension.0, d.Width, d.Height, d.Format.0, d.SampleDesc.Count);
