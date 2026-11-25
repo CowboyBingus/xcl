@@ -630,6 +630,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 None => (args, args_off),
             };
             ei_peek(this, 0, max, args, args_off + u64::from(msig.mesh_offset), count_buf, count_off);
+            if bounded.is_some() {
+                // lab: the clamp shader's own notes (kind 4: the record as it loaded it; 5: total, budget, x written; 6: records, kind, stride)
+                ei_peek(this, 4, max, args, 0x8000, 0, 0);
+                ei_peek(this, 5, max, args, 0x800C, 0, 0);
+                ei_peek(this, 6, max, args, 0x8018, 0, 0);
+            }
             let run = (|| -> Result<(), String> {
                 let (res_buf, res_va) = ensure_res_buffer(this, RES_BYTES)?;
                 bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
@@ -762,9 +768,9 @@ unsafe fn ei_peek(this: *mut c_void, kind: u8, max: u32, args: usize, args_at: u
     }
     // every n-th call of a kind (`XCL_EI_PEEK_EVERY`, default 4)
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static CALLS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static CALLS: [AtomicU64; 8] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
     let every = *EVERY.get_or_init(|| std::env::var("XCL_EI_PEEK_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64).max(1));
-    if CALLS[kind as usize & 3].fetch_add(1, Ordering::Relaxed) % every != 0 {
+    if CALLS[kind as usize & 7].fetch_add(1, Ordering::Relaxed) % every != 0 {
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
@@ -852,7 +858,7 @@ fn ei_peek_report() {
             if !empty && !(has_count && c == 0) {
                 row.4 += x as u64 * if kind == 1 { y as u64 } else { y as u64 * z as u64 };
             }
-            if row.5.len() < 10 && (!empty || row.0 % 97 == 1) {
+            if row.5.len() < 14 && (!empty || row.0 % 97 == 1 || kind >= 4) {
                 row.5.push(format!("max {max} [{x:#x} {y:#x} {z:#x}]{}", if has_count { format!(" count {c:#x}") } else { String::new() }));
             }
         }

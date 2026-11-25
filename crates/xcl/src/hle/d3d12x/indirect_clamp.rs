@@ -407,6 +407,93 @@ mod tests {
         assert_eq!(config(s, 7, 128, None, 99)[6], 99);
     }
 
+    /// lab: single records as a title's two-pass mesh calls pass them (max 1, small budgets)
+    #[test]
+    fn lab_single_records_with_small_budgets() {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            if crate::gpu::recomp::dxc::create_instance().is_none() {
+                crate::gpu::recomp::runner::skip_test("no DXC");
+                return;
+            }
+            let dev = dev.unwrap();
+            let Some(c) = clamper(&dev) else { panic!("the clamp pipeline was not made") };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let allocator: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            let buffer = |bytes: u64, heap, state, flags| -> ID3D12Resource {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: flags, ..Default::default()
+                };
+                let mut out = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut out).unwrap();
+                out.unwrap()
+            };
+            // (kind, budget, record)
+            let cases: [(u32, u32, [u32; 3]); 8] = [
+                (2, BUDGET, [0x10, 1, 1]),
+                (3, 102144, [1, 1, 1]),
+                (3, 102144, [0, 1, 1]),
+                (3, 833536, [0x1b, 1, 1]),
+                (3, BUDGET, [4, 1, 1]),
+                (2, 102144, [1, 1, 1]),
+                (3, 93056, [2, 1, 1]),
+                (3, 102144, [6, 1, 1]),
+            ];
+            let data: Vec<u32> = cases.iter().flat_map(|c| [c.2[0], c.2[1], c.2[2], 0xABCD]).collect();
+            let bytes = (data.len() * 4) as u64;
+            let upload = buffer(bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE);
+            let mut mapped: *mut c_void = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut mapped)).unwrap();
+            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast(), data.len());
+            upload.Unmap(0, None);
+            let src = buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            let out = buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            let readback = buffer(bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+            list.CopyBufferRegion(&src, 0, &upload, 0, bytes);
+            transition(&list, &src, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            for (i, c0) in cases.iter().enumerate() {
+                let s = Signature { stride: 12, action_at: 0, kind: c0.0 };
+                let cfg = config(s, 1, 0, None, c0.1);
+                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() }]);
+                list.SetPipelineState(&c.pso);
+                list.SetComputeRootSignature(&c.root);
+                list.SetComputeRootUnorderedAccessView(0, src.GetGPUVirtualAddress() + 16 * i as u64);
+                list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress() + 16 * i as u64);
+                list.SetComputeRootUnorderedAccessView(2, src.GetGPUVirtualAddress() + 16 * i as u64);
+                list.SetComputeRoot32BitConstants(3, CONFIG_WORDS, cfg.as_ptr().cast(), 0);
+                list.Dispatch(1, 1, 1);
+            }
+            transition(&list, &out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list.CopyBufferRegion(&readback, 0, &out, 0, bytes);
+            list.Close().unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, event).unwrap();
+            assert_eq!(WaitForSingleObject(event, 10_000), WAIT_OBJECT_0);
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let got = std::slice::from_raw_parts(mapped.cast::<u32>(), data.len()).to_vec();
+            readback.Unmap(0, None);
+            for (i, c0) in cases.iter().enumerate() {
+                eprintln!("case {i}: kind {} budget {} record {:x?} -> {:x?}", c0.0, c0.1, c0.2, &got[4 * i..4 * i + 3]);
+            }
+            for (i, c0) in cases.iter().enumerate() {
+                assert_eq!(&got[4 * i..4 * i + 3], &c0.2, "case {i}");
+            }
+        }
+    }
+
     /// The shader on the GPU: clamped records, and records past the budget emptied; everything
     /// else in a record copied as it is.
     #[test]
