@@ -644,7 +644,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             let run = (|| -> Result<(), String> {
                 let (res_buf, res_va) = ensure_res_buffer(this, RES_BYTES)?;
                 bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
-                pc(this, msig.companion_dispatch, max, args, args_off, count_buf, count_off);
+                // both passes read the records a dispatch before them wrote (the title's own, or
+                // the bounded copy): ordered after those writes as any other ExecuteIndirect is
+                // (`fresh_indirect_arguments`; NVIDIA runs the old records otherwise)
+                fresh_indirect_arguments(this, || pc(this, msig.companion_dispatch, max, args, args_off, count_buf, count_off));
                 emit_uav_barrier(list, Some(&res_buf));
                 {
                     // lab: record 0 as the compute pass left it (kind 4: vertices, primitives, spare; 5/6/7: position of vertex 0/1/2, w as the "count")
@@ -657,10 +660,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 if tp.mesh_groups_per_record > 1 && max > 0 && args != 0 {
                     let scaled = make_scaled_args_buffer(this, list, args, args_off, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record)?;
                     bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
-                    pc(this, sig, max, scaled.as_raw() as usize, 0, count_buf, count_off);
+                    fresh_indirect_arguments(this, || pc(this, sig, max, scaled.as_raw() as usize, 0, count_buf, count_off));
                 } else {
                     bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
-                    pc(this, sig, max, args, args_off, count_buf, count_off);
+                    fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
                 }
                 emit_uav_barrier(list, Some(&res_buf));
                 Ok(())
